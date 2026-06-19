@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+prompt-scratch.md
+.DS_Store
+.claude/
+mempalace.yaml
