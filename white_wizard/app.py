@@ -75,16 +75,26 @@ def load_prompt(name):
 # ---------------------------------------------------------------------------
 
 def parse_agent_plan(response):
+    """Parse a valid agent plan from Claude's response, or return None.
+
+    Only a dict with a non-empty ``agents`` list of named agent dicts counts as
+    a plan. A bare JSON array/string/number — or agents missing a name — returns
+    None so the caller treats it as "not a plan yet" instead of crashing.
+    """
     m = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL)
-    if m:
+    candidates = [m.group(1)] if m else []
+    candidates.append(response.strip())
+    for candidate in candidates:
         try:
-            return json.loads(m.group(1))
+            obj = json.loads(candidate)
         except Exception:
-            pass
-    try:
-        return json.loads(response.strip())
-    except Exception:
-        return None
+            continue
+        if (isinstance(obj, dict)
+                and isinstance(obj.get("agents"), list)
+                and obj["agents"]
+                and all(isinstance(a, dict) and a.get("name") for a in obj["agents"])):
+            return obj
+    return None
 
 
 def _wrap(text, width):
