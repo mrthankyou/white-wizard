@@ -317,29 +317,103 @@ def save_wizard_yaml(plan, team_selection, model):
 # wizard.yaml / handle existing
 # ---------------------------------------------------------------------------
 
-def handle_wizard_yaml(path):
+def _prompt_orchestration(data, user_prompt=None):
+    """Call Claude with the orchestration context and display the response."""
+    orch_json = json.dumps(data.get("orchestrations", []), indent=2)
+    if user_prompt:
+        prompt = (
+            "You are advising on a multi-agent orchestration built with White Wizard.\n\n"
+            f"Orchestration plan:\n{orch_json}\n\n"
+            f"User: {user_prompt}"
+        )
+    else:
+        prompt = load_prompt("wizard_yaml.md").replace("{orch_json}", orch_json)
+
+    response = conjure(ask, prompt, label="Consulting the wizard...", model=DEFAULT_MODEL)
+
     clear()
     show_header()
+    print(color("  Wizard\n", BOLD, CYAN))
+    print(color("  " + "─" * 50, DIM, WHITE))
+    for line in response.splitlines():
+        print(color("  " + line, WHITE))
+    print()
+    print(color("  Press any key to continue...", DIM, WHITE))
+    read_key()
 
-    spinner = itertools.cycle("|/-\\")
-    end = time.time() + 1.4
-    while time.time() < end:
-        sys.stdout.write(
-            "\r" + color(f"  {next(spinner)} ", GOLD)
-            + color("Reading wizard.yaml...", WHITE)
-        )
-        sys.stdout.flush()
-        time.sleep(0.08)
-    sys.stdout.write("\r" + " " * 48 + "\r")
 
-    with open(path) as f:
-        yaml_contents = f.read()
+def handle_wizard_yaml(path):
+    data           = load_wizard_yaml()
+    orchestrations = data.get("orchestrations", [])
+    last           = orchestrations[-1] if orchestrations else None
 
-    prompt_template = load_prompt("wizard_yaml.md")
-    prompt = prompt_template + "\n\n" + yaml_contents
+    WY_OPTIONS = ["Prompt the orchestration", "Run stream mode", "Type something", "Go back"]
+    WY_TYPE    = "Type something"
+    WY_BACK    = "Go back"
 
-    response = conjure(ask, prompt, label="Conjuring magic...", model=DEFAULT_MODEL)
-    return response
+    selected    = 0
+    custom_text = ""
+
+    while True:
+        clear()
+        show_header()
+        print(color("  wizard.yaml found\n", BOLD, GOLD))
+        if last:
+            team    = last.get("team", "unknown")
+            created = last.get("created_at", "")
+            agents  = last.get("agents", [])
+            print(color(f"  {team} orchestration  ·  {created}", WHITE))
+            for a in agents:
+                print(color(f"    · {a['name']}", DIM, WHITE))
+        else:
+            print(color("  No orchestrations in wizard.yaml yet.", DIM, WHITE))
+        print()
+        print(color("  What would you like to do?", BOLD, CYAN))
+        print(color("  (arrows · Enter to choose · q to quit)", DIM, WHITE))
+        print()
+
+        for i, opt in enumerate(WY_OPTIONS):
+            chosen = i == selected
+            if opt == WY_TYPE:
+                if chosen:
+                    body   = color(custom_text, WHITE) if custom_text else ""
+                    cursor = color("_", GRAY, BLINK)
+                    print(color("   > Type: ", BOLD, GOLD) + body + cursor)
+                else:
+                    print("     " + color(WY_TYPE, WHITE))
+            elif chosen:
+                print(color(f"   > {opt}  ", BOLD, GOLD, REV))
+            else:
+                print(color(f"     {opt}", WHITE))
+        print()
+
+        key       = read_key()
+        on_custom = WY_OPTIONS[selected] == WY_TYPE
+
+        if key == "up":
+            selected = (selected - 1) % len(WY_OPTIONS)
+        elif key == "down":
+            selected = (selected + 1) % len(WY_OPTIONS)
+        elif key == "enter":
+            choice = WY_OPTIONS[selected]
+            if choice == WY_BACK:
+                return "__back__"
+            elif choice == "Run stream mode":
+                run_stream_mode()
+            elif choice == "Prompt the orchestration":
+                _prompt_orchestration(data)
+            elif choice == WY_TYPE and custom_text.strip():
+                _prompt_orchestration(data, custom_text.strip())
+                custom_text = ""
+        elif key in ("q", "Q"):
+            return None
+        elif key == "esc":
+            return "__back__"
+        elif on_custom:
+            if key == "backspace":
+                custom_text = custom_text[:-1]
+            elif len(key) == 1 and key.isprintable():
+                custom_text += key
 
 
 # ---------------------------------------------------------------------------
@@ -1006,19 +1080,22 @@ def run_stream_mode():
 def main():
     wizard_yaml = find_wizard_yaml()
     if wizard_yaml:
-        response  = handle_wizard_yaml(wizard_yaml)
-        selection = response
+        result = handle_wizard_yaml(wizard_yaml)
+        if result != "__back__":
+            if result is None:
+                print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
+            return
+
+    files = scan_workspace()
+    if files:
+        selection = plan_with_ai(files)
     else:
-        files = scan_workspace()
-        if files:
-            selection = plan_with_ai(files)
-        else:
-            while True:
-                selection = select(OPTIONS, "What shall we summon today?")
-                if selection == "__stream__":
-                    run_stream_mode()
-                    continue
-                break
+        while True:
+            selection = select(OPTIONS, "What shall we summon today?")
+            if selection == "__stream__":
+                run_stream_mode()
+                continue
+            break
 
     if selection is None:
         print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))

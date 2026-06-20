@@ -1,7 +1,11 @@
-# Prompt: wizard.yaml found
+You are advising on a multi-agent orchestration system built with White Wizard.
 
-<!-- This prompt is sent to the AI when a wizard.yaml file is detected in the
-     user's working directory. The contents of wizard.yaml are appended after
-     this prompt at runtime. -->
+Review the orchestration plan below and provide a concise briefing:
+- What does this team do?
+- Are there any obvious gaps or improvements worth considering?
+- What are the top 2-3 recommended next steps for this team?
 
-TODO: add prompt content here
+Keep the response under 200 words.
+
+Orchestration plan:
+{orch_json}
