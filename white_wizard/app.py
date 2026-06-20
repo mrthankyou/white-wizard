@@ -1056,25 +1056,41 @@ def _build_question_prompt(template, q, git_diff, orch_plan, last_commit, curren
             .replace("{current_commit}", current_commit or "unknown"))
 
 
-def _route_next_question(answer, current_q, remaining):
-    """ROUTE state: the White Wizard agent reads an agent's answer and decides
-    which remaining question to visit next. Returns a question id or 'done'."""
-    if not remaining:
-        return "done"
-    menu = "\n".join(f'  - {q["id"]}: {q.get("prompt", "")}' for q in remaining)
+def _wizard_route(answer, current_q, remaining):
+    """ROUTE state: the White Wizard reads an agent's answer and decides
+    (a) whether it is an actionable finding worth surfacing to the user, and
+    (b) which remaining question to visit next ('done' to finish).
+
+    Returns (actionable: bool, next_id: str). Defaults to surfacing the finding
+    when the wizard's reply can't be parsed, so nothing is silently hidden.
+    """
+    default_next = remaining[0]["id"] if remaining else "done"
+    menu = "\n".join(f'  - {q["id"]}: {q.get("prompt", "")}' for q in remaining) or "  (none)"
     prompt = (
         "You are the White Wizard, the router in a two-state stream-mode state "
-        "machine. An agent has just answered a review question. Decide which "
-        "question the review should visit next.\n\n"
+        "machine. An agent has just answered a review question. Do two things:\n"
+        "1. Decide whether the answer is an ACTIONABLE finding (a real issue, a "
+        "needed change, or a concrete recommendation) or a NO-OP (no issues, "
+        "nothing to do).\n"
+        "2. Choose which remaining question to visit next, or finish.\n\n"
         f"Question answered ({current_q.get('id')}): {current_q.get('prompt', '')}\n\n"
         f"Agent's answer:\n{answer}\n\n"
-        "Remaining questions:\n" + menu + "\n\n"
-        "Reply with ONLY the id of the most relevant next question given the "
-        "answer, or 'done' if the review is complete."
+        f"Remaining questions:\n{menu}\n\n"
+        "Reply with ONLY a JSON object, no prose:\n"
+        '{"actionable": true or false, "next": "<question id, or done>"}'
     )
     decision = conjure(ask, prompt, label="Wizard routing...", model=DEFAULT_MODEL)
-    token = decision.strip().split()[0].lower() if decision.strip() else "done"
-    return re.sub(r"[^a-z0-9_]", "", token) or "done"
+
+    actionable, nxt = True, default_next
+    m = re.search(r"\{.*\}", decision, re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            actionable = bool(obj.get("actionable", True))
+            nxt = re.sub(r"[^a-z0-9_]", "", str(obj.get("next", default_next)).lower()) or "done"
+        except Exception:
+            pass
+    return actionable, nxt
 
 
 def run_stream_mode():
@@ -1122,29 +1138,40 @@ def run_stream_mode():
         answer = conjure(ask, prompt,
                          label=f"Stream [{current['id']}]...", model=DEFAULT_MODEL)
 
-        action = _stream_approval(current, answer)
-        if action == "approve":
-            wizard_db.save_finding(run_id, current["id"], current["priority"], answer, approved=True)
-            if current["id"] == "stream_self_improve":
-                _try_update_stream_questions(answer, data)
-        elif action == "skip":
+        # STATE 2 — ROUTE: the White Wizard judges the answer and picks next.
+        remaining = [q for q in questions
+                     if q["id"] not in visited and q["id"] != current["id"]]
+        actionable, nxt = _wizard_route(answer, current, remaining)
+
+        if actionable:
+            action = _stream_approval(current, answer)
+            if action == "approve":
+                wizard_db.save_finding(run_id, current["id"], current["priority"], answer, approved=True)
+                if current["id"] == "stream_self_improve":
+                    _try_update_stream_questions(answer, data)
+            elif action == "skip":
+                wizard_db.save_finding(run_id, current["id"], current["priority"], answer, approved=False)
+            elif action == "quit":
+                wizard_db.finish_stream_run(run_id, current_commit)
+                print(color("\n  Stream stopped.\n", DIM, WHITE))
+                return
+        else:
+            # NO-OP: the wizard auto-dismisses the finding without prompting.
             wizard_db.save_finding(run_id, current["id"], current["priority"], answer, approved=False)
-        elif action == "quit":
-            wizard_db.finish_stream_run(run_id, current_commit)
-            print(color("\n  Stream stopped.\n", DIM, WHITE))
-            return
+            clear()
+            show_header()
+            print(color(f"  Stream · {current['id']}  (priority {current['priority']})", BOLD, CYAN))
+            print(color("  " + "─" * 50, DIM, WHITE))
+            print(color(f"\n  {answer}\n", DIM, WHITE))
+            print(color("  (no action needed — continuing)\n", GRAY))
+            time.sleep(1.5)
 
         visited.add(current["id"])
 
-        # STATE 2 — ROUTE: the White Wizard decides the next question.
-        remaining = [q for q in questions if q["id"] not in visited]
-        if not remaining:
+        if nxt == "done" or not remaining:
             break
-        decision = _route_next_question(answer, current, remaining)
-        if decision == "done":
-            break
-        nxt     = by_id.get(decision)
-        current = nxt if (nxt and decision not in visited) else remaining[0]
+        candidate = by_id.get(nxt)
+        current   = candidate if (candidate and nxt not in visited) else remaining[0]
 
     wizard_db.finish_stream_run(run_id, current_commit)
     clear()
