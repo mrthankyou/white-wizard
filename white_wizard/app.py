@@ -317,10 +317,21 @@ def save_wizard_yaml(plan, team_selection, model):
 # wizard.yaml / handle existing
 # ---------------------------------------------------------------------------
 
-def _prompt_orchestration(data, user_prompt=None):
+def _prompt_orchestration(data, user_prompt=None, task_mode=False):
     """Call Claude with the orchestration context and display the response."""
     orch_json = json.dumps(data.get("orchestrations", []), indent=2)
-    if user_prompt:
+    last      = (data.get("orchestrations") or [{}])[-1]
+    team      = last.get("team", "dev")
+
+    if task_mode and user_prompt:
+        prompt = (
+            f"You are the orchestrator for a multi-agent {team} team.\n\n"
+            f"The user wants the team to: {user_prompt}\n\n"
+            f"Based on the plan below, outline which agents should handle this task, "
+            f"in what order, and what each agent should specifically do.\n\n"
+            f"Orchestration plan:\n{orch_json}"
+        )
+    elif user_prompt:
         prompt = (
             "You are advising on a multi-agent orchestration built with White Wizard.\n\n"
             f"Orchestration plan:\n{orch_json}\n\n"
@@ -346,10 +357,14 @@ def handle_wizard_yaml(path):
     data           = load_wizard_yaml()
     orchestrations = data.get("orchestrations", [])
     last           = orchestrations[-1] if orchestrations else None
+    team           = last.get("team", "Dev") if last else "Dev"
 
-    WY_OPTIONS = ["Prompt the orchestration", "Run stream mode", "Type something", "Go back"]
-    WY_TYPE    = "Type something"
-    WY_BACK    = "Go back"
+    TASK_OPT   = f"What do you want the {team} team to do?"
+    MANAGE_OPT = "Manage the system"
+    OTHER_OPT  = "Something else"
+    STREAM_OPT = "Start streaming"
+    WY_OPTIONS = [TASK_OPT, MANAGE_OPT, OTHER_OPT, STREAM_OPT]
+    TEXT_OPTS  = {TASK_OPT, OTHER_OPT}
 
     selected    = 0
     custom_text = ""
@@ -357,58 +372,61 @@ def handle_wizard_yaml(path):
     while True:
         clear()
         show_header()
-        print(color("  wizard.yaml found\n", BOLD, GOLD))
         if last:
-            team    = last.get("team", "unknown")
-            created = last.get("created_at", "")
             agents  = last.get("agents", [])
-            print(color(f"  {team} orchestration  ·  {created}", WHITE))
+            created = last.get("created_at", "")
+            print(color(f"  {team} orchestration  ·  {created}\n", BOLD, GOLD))
             for a in agents:
                 print(color(f"    · {a['name']}", DIM, WHITE))
         else:
             print(color("  No orchestrations in wizard.yaml yet.", DIM, WHITE))
         print()
-        print(color("  What would you like to do?", BOLD, CYAN))
         print(color("  (arrows · Enter to choose · q to quit)", DIM, WHITE))
         print()
 
+        on_custom = WY_OPTIONS[selected] in TEXT_OPTS
+
         for i, opt in enumerate(WY_OPTIONS):
             chosen = i == selected
-            if opt == WY_TYPE:
+            if opt in TEXT_OPTS:
                 if chosen:
                     body   = color(custom_text, WHITE) if custom_text else ""
                     cursor = color("_", GRAY, BLINK)
-                    print(color("   > Type: ", BOLD, GOLD) + body + cursor)
+                    print(color(f"   > {opt}: ", BOLD, GOLD) + body + cursor)
                 else:
-                    print("     " + color(WY_TYPE, WHITE))
+                    print("     " + color(opt, WHITE))
             elif chosen:
                 print(color(f"   > {opt}  ", BOLD, GOLD, REV))
             else:
                 print(color(f"     {opt}", WHITE))
         print()
 
-        key       = read_key()
-        on_custom = WY_OPTIONS[selected] == WY_TYPE
+        key = read_key()
 
         if key == "up":
+            prev = selected
             selected = (selected - 1) % len(WY_OPTIONS)
+            if selected != prev:
+                custom_text = ""
         elif key == "down":
+            prev = selected
             selected = (selected + 1) % len(WY_OPTIONS)
+            if selected != prev:
+                custom_text = ""
         elif key == "enter":
             choice = WY_OPTIONS[selected]
-            if choice == WY_BACK:
-                return "__back__"
-            elif choice == "Run stream mode":
+            if choice == STREAM_OPT:
                 run_stream_mode()
-            elif choice == "Prompt the orchestration":
+            elif choice == MANAGE_OPT:
                 _prompt_orchestration(data)
-            elif choice == WY_TYPE and custom_text.strip():
-                _prompt_orchestration(data, custom_text.strip())
+            elif choice in TEXT_OPTS and custom_text.strip():
+                _prompt_orchestration(data, custom_text.strip(),
+                                      task_mode=(choice == TASK_OPT))
                 custom_text = ""
         elif key in ("q", "Q") and not on_custom:
             return None
         elif key == "esc":
-            return "__back__"
+            return None
         elif on_custom:
             if key == "backspace":
                 custom_text = custom_text[:-1]
@@ -1081,10 +1099,9 @@ def main():
     wizard_yaml = find_wizard_yaml()
     if wizard_yaml:
         result = handle_wizard_yaml(wizard_yaml)
-        if result != "__back__":
-            if result is None:
-                print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
-            return
+        if result is None:
+            print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
+        return
 
     files = scan_workspace()
     if files:
@@ -1101,5 +1118,11 @@ def main():
         print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
         return
 
-    if selection != "done":
+    if selection == "done":
+        wizard_yaml = find_wizard_yaml()
+        if wizard_yaml:
+            result = handle_wizard_yaml(wizard_yaml)
+            if result is None:
+                print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
+    else:
         print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
