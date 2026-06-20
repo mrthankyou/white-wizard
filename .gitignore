@@ -5,3 +5,6 @@ prompt-scratch.md
 .claude/
 mempalace.yaml
 todo.md
+.wizard/
+*.egg-info/
+dist/
