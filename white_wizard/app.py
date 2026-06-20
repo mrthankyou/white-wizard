@@ -317,6 +317,25 @@ def save_wizard_yaml(plan, team_selection, model):
 # wizard.yaml / handle existing
 # ---------------------------------------------------------------------------
 
+def _show_wizard_response(response):
+    """Render a Claude response in the wizard frame and wait for a keypress."""
+    clear()
+    show_header()
+    print(color("  Wizard\n", BOLD, CYAN))
+    print(color("  " + "─" * 50, DIM, WHITE))
+    for line in response.splitlines():
+        print(color("  " + line, WHITE))
+    print()
+    print(color("  Press any key to continue...", DIM, WHITE))
+    read_key()
+
+
+def _ask_and_show(query):
+    """Send a free-form user query to Claude and display the reply."""
+    response = conjure(ask, query, label="Consulting the wizard...", model=DEFAULT_MODEL)
+    _show_wizard_response(response)
+
+
 def _prompt_orchestration(data, user_prompt=None, task_mode=False):
     """Call Claude with the orchestration context and display the response."""
     orch_json = json.dumps(data.get("orchestrations", []), indent=2)
@@ -341,16 +360,7 @@ def _prompt_orchestration(data, user_prompt=None, task_mode=False):
         prompt = load_prompt("wizard_yaml.md").replace("{orch_json}", orch_json)
 
     response = conjure(ask, prompt, label="Consulting the wizard...", model=DEFAULT_MODEL)
-
-    clear()
-    show_header()
-    print(color("  Wizard\n", BOLD, CYAN))
-    print(color("  " + "─" * 50, DIM, WHITE))
-    for line in response.splitlines():
-        print(color("  " + line, WHITE))
-    print()
-    print(color("  Press any key to continue...", DIM, WHITE))
-    read_key()
+    _show_wizard_response(response)
 
 
 def handle_wizard_yaml(path):
@@ -580,10 +590,10 @@ def select(options, title,
         render_menu(options, selected, title, hint, custom_text)
         key      = read_key()
         on_custom = options[selected] == CUSTOM_OPTION
-        if key == "up":
+        if key == "up" and active:
             idx      = active.index(selected) if selected in active else 0
             selected = active[(idx - 1) % len(active)]
-        elif key == "down":
+        elif key == "down" and active:
             idx      = active.index(selected) if selected in active else 0
             selected = active[(idx + 1) % len(active)]
         elif key == "enter":
@@ -770,7 +780,6 @@ DISABLED_TYPES = {
     "Create devops team",
     "Create performance team",
     "Create security team",
-    CUSTOM_OPTION,
 }
 
 TEAM_PROMPTS = {
@@ -1002,23 +1011,75 @@ def _stream_approval(question, response):
             return "quit"
 
 
+def _valid_question(q):
+    """A stream question must have a non-empty id/prompt and an int priority."""
+    return (
+        isinstance(q, dict)
+        and isinstance(q.get("id"), str) and q["id"].strip()
+        and isinstance(q.get("prompt"), str) and q["prompt"].strip()
+        and isinstance(q.get("priority"), int) and not isinstance(q["priority"], bool)
+    )
+
+
 def _try_update_stream_questions(response, data):
-    """If Claude returned a revised question list, write it back to wizard.yaml."""
+    """If Claude returned a valid revised question list, write it back to wizard.yaml.
+
+    The whole list is rejected if any item is malformed, so a bad AI response
+    can never leave the persisted questions in a half-broken state.
+    """
     m = re.search(r'```json\s*(\[.*?\])\s*```', response, re.DOTALL)
     if not m:
         return
     try:
         new_questions = json.loads(m.group(1))
-        if isinstance(new_questions, list) and new_questions:
-            data.setdefault("stream", {})["questions"] = new_questions
-            save_wizard_yaml_data(data)
-            print(color("\n  Stream questions updated in wizard.yaml.\n", BOLD, GOLD))
     except Exception:
-        pass
+        return
+    if not (isinstance(new_questions, list) and new_questions):
+        return
+    if not all(_valid_question(q) for q in new_questions):
+        return
+    cleaned = [
+        {"priority": q["priority"], "id": q["id"], "prompt": q["prompt"]}
+        for q in new_questions
+    ]
+    data.setdefault("stream", {})["questions"] = cleaned
+    save_wizard_yaml_data(data)
+    print(color("\n  Stream questions updated in wizard.yaml.\n", BOLD, GOLD))
+
+
+def _build_question_prompt(template, q, git_diff, orch_plan, last_commit, current_commit):
+    return (template
+            .replace("{question_prompt}", q.get("prompt", ""))
+            .replace("{git_diff}", git_diff[:4000])
+            .replace("{orch_plan}", orch_plan[:2000])
+            .replace("{last_commit}", last_commit or "none")
+            .replace("{current_commit}", current_commit or "unknown"))
+
+
+def _route_next_question(answer, current_q, remaining):
+    """ROUTE state: the White Wizard agent reads an agent's answer and decides
+    which remaining question to visit next. Returns a question id or 'done'."""
+    if not remaining:
+        return "done"
+    menu = "\n".join(f'  - {q["id"]}: {q.get("prompt", "")}' for q in remaining)
+    prompt = (
+        "You are the White Wizard, the router in a two-state stream-mode state "
+        "machine. An agent has just answered a review question. Decide which "
+        "question the review should visit next.\n\n"
+        f"Question answered ({current_q.get('id')}): {current_q.get('prompt', '')}\n\n"
+        f"Agent's answer:\n{answer}\n\n"
+        "Remaining questions:\n" + menu + "\n\n"
+        "Reply with ONLY the id of the most relevant next question given the "
+        "answer, or 'done' if the review is complete."
+    )
+    decision = conjure(ask, prompt, label="Wizard routing...", model=DEFAULT_MODEL)
+    token = decision.strip().split()[0].lower() if decision.strip() else "done"
+    return re.sub(r"[^a-z0-9_]", "", token) or "done"
 
 
 def run_stream_mode():
-    """Execute the prioritized stream question checklist against the current codebase."""
+    """Run stream mode as a two-state machine: an agent ANSWERs the current
+    question, then the White Wizard ROUTEs to the next question (or finishes)."""
     clear()
     show_header()
 
@@ -1029,10 +1090,12 @@ def run_stream_mode():
         return
 
     data      = load_wizard_yaml()
-    questions = sorted(
-        data.get("stream", {}).get("questions", DEFAULT_STREAM_QUESTIONS),
-        key=lambda q: q["priority"],
-    )
+    questions = [q for q in data.get("stream", {}).get("questions", DEFAULT_STREAM_QUESTIONS)
+                 if _valid_question(q)]
+    if not questions:
+        questions = list(DEFAULT_STREAM_QUESTIONS)
+    questions.sort(key=lambda q: q["priority"])
+    by_id     = {q["id"]: q for q in questions}
     orch_plan = json.dumps(data.get("orchestrations", []), indent=2)
 
     git_diff      = _git_diff()
@@ -1046,49 +1109,48 @@ def run_stream_mode():
     print(color(f"  Last commit scanned: {stats['last_commit'] or 'none'}\n", WHITE))
     time.sleep(1.2)
 
-    run_id = wizard_db.start_stream_run(current_commit, git_diff)
+    run_id   = wizard_db.start_stream_run(current_commit, git_diff)
     template = load_prompt("stream_question.md")
 
-    for q in questions:
-        prompt = (template
-                  .replace("{question_prompt}", q["prompt"])
-                  .replace("{git_diff}", git_diff[:4000])
-                  .replace("{orch_plan}", orch_plan[:2000])
-                  .replace("{last_commit}", last_commit or "none")
-                  .replace("{current_commit}", current_commit or "unknown"))
+    current = questions[0]
+    visited = set()
 
-        response = conjure(ask, prompt,
-                           label=f"Stream [{q['id']}]...", model=DEFAULT_MODEL)
+    while current and current["id"] not in visited:
+        # STATE 1 — ANSWER: an agent answers the current question.
+        prompt = _build_question_prompt(template, current, git_diff, orch_plan,
+                                        last_commit, current_commit)
+        answer = conjure(ask, prompt,
+                         label=f"Stream [{current['id']}]...", model=DEFAULT_MODEL)
 
-        if "no issues found" in response.lower() or "no changes needed" in response.lower():
-            wizard_db.save_finding(run_id, q["id"], q["priority"], response, approved=False)
-            clear()
-            show_header()
-            print(color(f"  Stream · {q['id']}  (priority {q['priority']})", BOLD, CYAN))
-            print(color("  " + "─" * 50, DIM, WHITE))
-            print(color(f"\n  {response}\n", DIM, WHITE))
-            print(color("  (no action needed — continuing)\n", GRAY))
-            time.sleep(1.5)
-            continue
-
-        action = _stream_approval(q, response)
-
+        action = _stream_approval(current, answer)
         if action == "approve":
-            wizard_db.save_finding(run_id, q["id"], q["priority"], response, approved=True)
-            if q["id"] == "stream_self_improve":
-                _try_update_stream_questions(response, data)
+            wizard_db.save_finding(run_id, current["id"], current["priority"], answer, approved=True)
+            if current["id"] == "stream_self_improve":
+                _try_update_stream_questions(answer, data)
         elif action == "skip":
-            wizard_db.save_finding(run_id, q["id"], q["priority"], response, approved=False)
+            wizard_db.save_finding(run_id, current["id"], current["priority"], answer, approved=False)
         elif action == "quit":
             wizard_db.finish_stream_run(run_id, current_commit)
             print(color("\n  Stream stopped.\n", DIM, WHITE))
             return
 
+        visited.add(current["id"])
+
+        # STATE 2 — ROUTE: the White Wizard decides the next question.
+        remaining = [q for q in questions if q["id"] not in visited]
+        if not remaining:
+            break
+        decision = _route_next_question(answer, current, remaining)
+        if decision == "done":
+            break
+        nxt     = by_id.get(decision)
+        current = nxt if (nxt and decision not in visited) else remaining[0]
+
     wizard_db.finish_stream_run(run_id, current_commit)
     clear()
     show_header()
     print(color("  Stream complete.\n", BOLD, GOLD))
-    print(color(f"  All {len(questions)} questions processed.\n", DIM, WHITE))
+    print(color(f"  {len(visited)} question(s) processed.\n", DIM, WHITE))
 
 
 # ---------------------------------------------------------------------------
@@ -1111,6 +1173,9 @@ def main():
             selection = select(OPTIONS, "What shall we summon today?")
             if selection == "__stream__":
                 run_stream_mode()
+                continue
+            if selection is not None and selection not in OPTIONS:
+                _ask_and_show(selection)
                 continue
             break
 

@@ -24,7 +24,7 @@ Current commit: {current_commit}
 
 Answer the question above based on the context provided. Be specific and concise.
 
-If there are no issues to report, say exactly: "No issues found."
+If there are no issues to report, say so briefly.
 
 If this is the self-improvement question (about updating stream questions), return the revised question list as a JSON code block in this exact format:
 ```json
