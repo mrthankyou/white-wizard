@@ -405,7 +405,7 @@ def handle_wizard_yaml(path):
             elif choice == WY_TYPE and custom_text.strip():
                 _prompt_orchestration(data, custom_text.strip())
                 custom_text = ""
-        elif key in ("q", "Q"):
+        elif key in ("q", "Q") and not on_custom:
             return None
         elif key == "esc":
             return "__back__"
