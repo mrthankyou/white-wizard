@@ -435,7 +435,7 @@ def scan_workspace():
     clear()
     show_header()
 
-    spinner  = itertools.cycle("|/-\\")
+    spinner  = itertools.cycle("◆◈◇◈")
     files    = []
     walker   = os.walk(root)
     finished = False
@@ -694,7 +694,7 @@ def yes_no(question):
 # ---------------------------------------------------------------------------
 
 def loading(label, seconds=3.0):
-    spinner = itertools.cycle("|/-\\")
+    spinner = itertools.cycle("◆◈◇◈")
     end     = time.time() + seconds
     while time.time() < end:
         sys.stdout.write("\r" + color(f"  {next(spinner)} ", GOLD) + color(label, WHITE))
@@ -722,7 +722,7 @@ def conjure(fn, *args, label="Conjuring magic...", **kwargs):
 
     threading.Thread(target=worker, daemon=True).start()
 
-    spinner = itertools.cycle("|/-\\")
+    spinner = itertools.cycle("◆◈◇◈")
     while not done.is_set():
         sys.stdout.write("\r" + color(f"  {next(spinner)} ", GOLD) + color(label, WHITE))
         sys.stdout.flush()
