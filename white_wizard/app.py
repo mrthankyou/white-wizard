@@ -338,7 +338,7 @@ def handle_wizard_yaml(path):
     prompt_template = load_prompt("wizard_yaml.md")
     prompt = prompt_template + "\n\n" + yaml_contents
 
-    response = conjure(ask, prompt, label="Conjuring magic...")
+    response = conjure(ask, prompt, label="Conjuring magic...", model=DEFAULT_MODEL)
     return response
 
 
@@ -910,7 +910,7 @@ def _stream_approval(question, response):
             return "quit"
 
 
-def _try_update_stream_questions(response, yaml_path, data):
+def _try_update_stream_questions(response, data):
     """If Claude returned a revised question list, write it back to wizard.yaml."""
     m = re.search(r'```json\s*(\[.*?\])\s*```', response, re.DOTALL)
     if not m:
@@ -918,7 +918,7 @@ def _try_update_stream_questions(response, yaml_path, data):
     try:
         new_questions = json.loads(m.group(1))
         if isinstance(new_questions, list) and new_questions:
-            data["stream"]["questions"] = new_questions
+            data.setdefault("stream", {})["questions"] = new_questions
             save_wizard_yaml_data(data)
             print(color("\n  Stream questions updated in wizard.yaml.\n", BOLD, GOLD))
     except Exception:
@@ -984,7 +984,7 @@ def run_stream_mode():
         if action == "approve":
             wizard_db.save_finding(run_id, q["id"], q["priority"], response, approved=True)
             if q["id"] == "stream_self_improve":
-                _try_update_stream_questions(response, yaml_path, data)
+                _try_update_stream_questions(response, data)
         elif action == "skip":
             wizard_db.save_finding(run_id, q["id"], q["priority"], response, approved=False)
         elif action == "quit":
@@ -996,10 +996,6 @@ def run_stream_mode():
     clear()
     show_header()
     print(color("  Stream complete.\n", BOLD, GOLD))
-    approved = sum(
-        1 for q in questions
-        if wizard_db.get_stream_stats()["approved_findings"]
-    )
     print(color(f"  All {len(questions)} questions processed.\n", DIM, WHITE))
 
 
