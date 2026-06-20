@@ -1,8 +1,14 @@
 """AI client for White Wizard.
 
+All AI access funnels through ``ask_messages(messages, ...)``, where ``messages``
+is a list of ``{"role", "content"}`` dicts. ``ask`` and ``ask_with_history`` are
+convenience wrappers that build that list. Backends consume messages directly, so
+adding a new one (e.g. the Claude SDK) is a localized change here — no caller in
+the app touches anything but ``ask`` / ``ask_with_history``.
+
 Backends:
   mock   — offline, returns a canned response (default)
-  claude — shells out to `claude -p` for live responses
+  claude — flattens messages into a single `claude -p` prompt
 
 The backend is chosen by passing --mock or --claude when running wizard.
 """
@@ -61,32 +67,41 @@ def parse_args(argv=None):
     return {"stream": stream}
 
 
-def ask_with_history(history, new_message, *, model=None, backend=None, timeout=120):
-    """Send a message with prior conversation history serialized into the prompt."""
-    if not history:
-        return ask(new_message, model=model, backend=backend, timeout=timeout)
-    parts = []
-    for role, content in history:
-        label = "User" if role == "user" else "Assistant"
-        parts.append(f"{label}: {content}")
-    parts.append(f"User: {new_message}")
-    parts.append("Assistant:")
-    return ask("\n\n".join(parts), model=model, backend=backend, timeout=timeout)
+def ask_messages(messages, *, model=None, backend=None, timeout=120):
+    """Send a structured list of {"role", "content"} messages to the backend.
 
-
-def ask(prompt, *, model=None, backend=None, timeout=120):
-    """Send prompt to the AI and return its text response."""
+    This is the canonical entry point. ``ask`` and ``ask_with_history`` are thin
+    wrappers that build the message list. Backends consume messages directly — a
+    future SDK backend would hand them straight to ``messages.create`` — while the
+    CLI backend flattens them into a single ``claude -p`` prompt.
+    """
     resolved = backend or _backend
     if resolved == "mock":
-        return _mock(prompt, model=model)
+        return _mock(messages, model=model)
     if resolved == "claude":
-        return _claude(prompt, model=model, timeout=timeout)
+        return _claude(messages, model=model, timeout=timeout)
     raise ValueError(f"Unknown AI backend: {resolved!r} (expected one of {BACKENDS})")
 
 
-def _mock(prompt, *, model=None):
+def ask(prompt, *, model=None, backend=None, timeout=120):
+    """Send a single-turn user prompt and return the text response."""
+    return ask_messages(
+        [{"role": "user", "content": prompt}],
+        model=model, backend=backend, timeout=timeout,
+    )
+
+
+def ask_with_history(history, new_message, *, model=None, backend=None, timeout=120):
+    """Send a new user message preceded by prior (role, content) turns."""
+    messages = [{"role": role, "content": content} for role, content in history]
+    messages.append({"role": "user", "content": new_message})
+    return ask_messages(messages, model=model, backend=backend, timeout=timeout)
+
+
+def _mock(messages, *, model=None):
     name = model or "mock-model"
-    first = next((ln for ln in prompt.strip().splitlines() if ln.strip()), "(empty prompt)")
+    last = messages[-1]["content"] if messages else ""
+    first = next((ln for ln in last.strip().splitlines() if ln.strip()), "(empty prompt)")
     return (f"[mock:{name}] Simulated AI response. You asked: {first.strip()[:200]}")
 
 
@@ -98,14 +113,30 @@ def kill_current():
         proc.kill()
 
 
-def _claude(prompt, *, model=None, timeout=120):
+def _flatten(messages):
+    """Serialize messages into a single prompt string for the `claude -p` CLI.
+
+    A lone user message passes through unchanged; a multi-turn exchange becomes
+    labelled User:/Assistant: turns ending on an open Assistant turn.
+    """
+    if len(messages) == 1 and messages[0]["role"] == "user":
+        return messages[0]["content"]
+    parts = []
+    for m in messages:
+        label = "User" if m["role"] == "user" else "Assistant"
+        parts.append(f"{label}: {m['content']}")
+    parts.append("Assistant:")
+    return "\n\n".join(parts)
+
+
+def _claude(messages, *, model=None, timeout=120):
     global _current_proc
     if shutil.which("claude") is None:
         raise RuntimeError(
             "`claude` CLI not found on PATH. "
             "Install it or run without --claude to use the mock."
         )
-    cmd = ["claude", "-p", prompt]
+    cmd = ["claude", "-p", _flatten(messages)]
     if model:
         cmd += ["--model", model]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
