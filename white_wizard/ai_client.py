@@ -99,6 +99,9 @@ def ask_with_history(history, new_message, *, model=None, backend=None, timeout=
 
 
 def _mock(messages, *, model=None):
+    override = os.environ.get("WHITE_WIZARD_MOCK_REPLY")
+    if override is not None:
+        return override
     name = model or "mock-model"
     last = messages[-1]["content"] if messages else ""
     first = next((ln for ln in last.strip().splitlines() if ln.strip()), "(empty prompt)")

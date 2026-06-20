@@ -1,7 +1,8 @@
 """SQLite state layer for White Wizard.
 
 All runtime/operational data lives in .wizard/state.db in the project directory.
-Config (stream questions, orchestration plans) stays in wizard.yaml.
+The wizard's own config (settings, stream thoughts) stays in wizard.yaml; the
+orchestration itself lives in the AI's native store (.claude/ for Claude).
 """
 import os
 import sqlite3
@@ -34,13 +35,19 @@ def init_db():
             CREATE TABLE IF NOT EXISTS stream_findings (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id      INTEGER NOT NULL REFERENCES stream_runs(id),
-                question_id TEXT NOT NULL,
+                thought_id  TEXT NOT NULL,
                 priority    INTEGER NOT NULL,
                 response    TEXT NOT NULL,
                 approved    INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT NOT NULL
             );
         """)
+        # Migrate pre-existing DBs that still use the old column name.
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(stream_findings)")]
+        if "question_id" in cols and "thought_id" not in cols:
+            conn.execute(
+                "ALTER TABLE stream_findings RENAME COLUMN question_id TO thought_id"
+            )
 
 
 def start_stream_run(commit_hash, git_diff):
@@ -65,14 +72,14 @@ def finish_stream_run(run_id, commit_hash):
         )
 
 
-def save_finding(run_id, question_id, priority, response, approved):
-    """Persist a stream finding."""
+def save_finding(run_id, thought_id, priority, response, approved):
+    """Persist a stream finding (the reviewed orchestration/code text)."""
     with _connect() as conn:
         conn.execute(
             "INSERT INTO stream_findings "
-            "(run_id, question_id, priority, response, approved, created_at) "
+            "(run_id, thought_id, priority, response, approved, created_at) "
             "VALUES (?, ?, ?, ?, ?, datetime('now'))",
-            (run_id, question_id, priority, response, int(approved)),
+            (run_id, thought_id, priority, response, int(approved)),
         )
 
 
