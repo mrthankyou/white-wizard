@@ -1,5 +1,20 @@
 # White Wizard
 
+```
+                /\
+               /  \
+              / ** \
+             /  *   \
+            /   **   \
+           /  *    *  \
+          /     **    \
+         /____________ \
+    ____/______________\____
+   (________________________)
+
+          The White Wizard
+```
+
 Conjure multi-agent orchestration systems with a single button.
 
 White Wizard scans your codebase, proposes a state-machine agent team tailored to your project, generates all the scaffolding (agents, MCP state machine, orchestrator), and keeps the system healthy over time via stream mode.
