@@ -459,6 +459,9 @@ def render_menu(options, selected, title, hint, custom_text):
         else:
             print(color(f"     {option}", WHITE))
     print()
+    print(color("  " + "─" * 40, DIM, WHITE))
+    print(color("  s  ·  Stream mode", DIM, WHITE))
+    print()
 
 
 def select(options, title,
@@ -497,6 +500,8 @@ def select(options, title,
             return options[selected]
         elif key == "esc":
             return None
+        elif key in ("s", "S") and not on_custom:
+            return "__stream__"
         elif on_custom:
             if key == "backspace":
                 custom_text = custom_text[:-1]
@@ -835,6 +840,9 @@ def plan_with_ai(files):
         team = select(ORCH_TYPES, "Which team do you want to set up?")
         if team is None:
             return None
+        if team == "__stream__":
+            run_stream_mode()
+            continue
         custom_desc = team if team not in TEAM_PROMPTS and team != CUSTOM_OPTION else ""
         result = run_team_conversation(team, synopsis, custom_description=custom_desc)
         if result is not None:
@@ -1009,7 +1017,12 @@ def main():
         if files:
             selection = plan_with_ai(files)
         else:
-            selection = select(OPTIONS, "What shall we summon today?")
+            while True:
+                selection = select(OPTIONS, "What shall we summon today?")
+                if selection == "__stream__":
+                    run_stream_mode()
+                    continue
+                break
 
     if selection is None:
         print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))

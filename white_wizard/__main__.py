@@ -1,8 +1,10 @@
 """Entry point for `python3 -m white_wizard` and the `wizard` CLI command."""
 from white_wizard import ai_client, app
+from white_wizard import db as wizard_db
 
 
 def main():
+    wizard_db.init_db()
     flags = ai_client.parse_args()
     try:
         if flags["stream"]:
