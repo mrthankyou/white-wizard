@@ -15,6 +15,7 @@ DEFAULT_BACKEND = "mock"
 BACKENDS = ("mock", "claude")
 
 _backend = DEFAULT_BACKEND
+_current_proc = None  # live claude subprocess, if any
 
 HELP = """\
 White Wizard - conjure multi-agent orchestration systems with a single button.
@@ -89,7 +90,16 @@ def _mock(prompt, *, model=None):
     return (f"[mock:{name}] Simulated AI response. You asked: {first.strip()[:200]}")
 
 
+def kill_current():
+    """Kill the in-flight claude subprocess, if any. Safe to call from any thread."""
+    global _current_proc
+    proc = _current_proc
+    if proc and proc.poll() is None:
+        proc.kill()
+
+
 def _claude(prompt, *, model=None, timeout=120):
+    global _current_proc
     if shutil.which("claude") is None:
         raise RuntimeError(
             "`claude` CLI not found on PATH. "
@@ -98,10 +108,19 @@ def _claude(prompt, *, model=None, timeout=120):
     cmd = ["claude", "-p", prompt]
     if model:
         cmd += ["--model", model]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if result.returncode != 0:
-        raise RuntimeError(f"claude exited {result.returncode}: {result.stderr.strip()}")
-    return result.stdout.strip()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    _current_proc = proc
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise RuntimeError(f"claude timed out after {timeout}s")
+    finally:
+        _current_proc = None
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude exited {proc.returncode}: {stderr.strip()}")
+    return stdout.strip()
 
 
 if __name__ == "__main__":

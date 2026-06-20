@@ -12,6 +12,7 @@ def main():
         else:
             app.main()
     except (KeyboardInterrupt, EOFError):
+        ai_client.kill_current()
         from white_wizard.app import color, DIM, WHITE
         print(color("\n\n  The staff dims. Farewell.\n", DIM, WHITE))
 
