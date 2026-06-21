@@ -19,6 +19,10 @@ WHITE = "\033[97m"
 GOLD  = "\033[96m"
 CYAN  = "\033[36m"
 GRAY  = "\033[90m"
+BLUE        = "\033[34m"
+BRIGHT_BLUE = "\033[94m"
+# Amber/orange — the complement of the blue theme, used for danger/warnings.
+DANGER      = "\033[38;5;208m"
 
 WIZARD = r"""
                 /\
@@ -36,6 +40,32 @@ WIZARD = r"""
 
 def color(text, *codes):
     return "".join(codes) + text + RESET
+
+
+# Blue-flame spinner -----------------------------------------------------------
+# Three diamonds that flicker through a blue→white gradient, out of phase, so the
+# loading indicator reads like a small blue fire instead of one spinning diamond.
+
+_FLAME_RAMP  = (BLUE, BRIGHT_BLUE, CYAN, GOLD, WHITE)  # cool → hot
+_FLAME_GLYPH = ("◇", "◇", "◈", "◆", "◆")              # dim → bright
+
+
+def _flame_frames():
+    span   = len(_FLAME_RAMP)
+    period = 2 * (span - 1)               # triangle wave: cool → hot → cool
+    frames = []
+    for t in range(period):
+        cells = []
+        for pos in range(3):
+            phase = (t + pos * 3) % period   # each diamond offset for a lively shimmer
+            level = phase if phase < span else period - phase
+            cells.append(_FLAME_RAMP[level] + _FLAME_GLYPH[level] + RESET)
+        frames.append(" ".join(cells))
+    return frames
+
+
+# Pre-rendered, fully coloured frames; cycle with itertools.cycle(SPINNER_FRAMES).
+SPINNER_FRAMES = _flame_frames()
 
 
 def clear():
@@ -61,7 +91,7 @@ def read_key():
         if ch == "\033":
             if sys.stdin.read(1) == "[":
                 code = sys.stdin.read(1)
-                return {"A": "up", "B": "down"}.get(code, "ignore")
+                return {"A": "up", "B": "down", "Z": "shift_tab"}.get(code, "ignore")
             return "esc"
         if ch in ("\r", "\n"):
             return "enter"
@@ -190,7 +220,9 @@ def menu(options, title="", hint="", render_top=None, footer=None, extra_keys=No
             return cur.value, texts.get(selected, "").strip()
         elif key == "esc":
             return None, ""
-        elif key in extra_keys and not on_text:
+        elif key in extra_keys and (not on_text or len(key) > 1):
+            # Single-char extra keys are typed into a text row; multi-char
+            # control keys (e.g. shift+tab) always fire so they work everywhere.
             return extra_keys[key], ""
         elif key in ("q", "Q") and not on_text:
             return None, ""

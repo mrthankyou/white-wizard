@@ -12,6 +12,7 @@ Backends:
 
 The backend is chosen by passing --mock or --claude when running wizard.
 """
+import logging
 import os
 import shutil
 import subprocess
@@ -22,6 +23,37 @@ BACKENDS = ("mock", "claude")
 
 _backend = DEFAULT_BACKEND
 _current_proc = None  # live claude subprocess, if any
+_logger = None        # debug logger when --debug is on, else None
+_log_path = None      # path to the active debug log, for display
+_seq = 0              # request counter, to pair prompts with responses
+
+
+def enable_debug_logging():
+    """Turn on the AI request/response trace log under .wizard/, return its path.
+
+    Every prompt sent to the backend and every response (or error) is appended,
+    so a failed run can be inspected after the fact. The log lives in .wizard/
+    (gitignored) and is reused across runs.
+    """
+    global _logger, _log_path
+    wizard_dir = os.path.join(os.getcwd(), ".wizard")
+    os.makedirs(wizard_dir, exist_ok=True)
+    _log_path = os.path.join(wizard_dir, "debug.log")
+    logger = logging.getLogger("white_wizard.debug")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = logging.FileHandler(_log_path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        logger.addHandler(handler)
+    _logger = logger
+    logger.info("=== debug logging enabled (backend=%s) ===", _backend)
+    return _log_path
+
+
+def debug_log_path():
+    """Path of the active debug log, or None if --debug was not passed."""
+    return _log_path
 
 HELP = """\
 White Wizard - conjure multi-agent orchestration systems with a single button.
@@ -35,19 +67,21 @@ Options:
   --claude    Use the Claude CLI backend (`claude -p`).
   --stream    Run stream mode: execute the prioritized review checklist
               against the current codebase (requires wizard.yaml).
+  --debug     Log every AI prompt and response to .wizard/debug.log.
   --help      Show this help message and exit.
 
 Examples:
   wizard                   # run with mock AI (default)
   wizard --claude          # use real Claude CLI
   wizard --claude --stream # stream mode with real Claude
+  wizard --claude --debug  # trace AI prompts/responses to .wizard/debug.log
 """
 
 
 def parse_args(argv=None):
     """Strip known flags from argv and configure the module backend.
 
-    Returns a dict with keys: stream (bool).
+    Returns a dict with keys: stream (bool), debug (bool).
     Prints help and exits on --help.
     """
     global _backend
@@ -64,7 +98,11 @@ def parse_args(argv=None):
     stream = "--stream" in argv
     if stream:
         argv.remove("--stream")
-    return {"stream": stream}
+    debug = "--debug" in argv
+    if debug:
+        argv.remove("--debug")
+        enable_debug_logging()
+    return {"stream": stream, "debug": debug}
 
 
 def ask_messages(messages, *, model=None, backend=None, timeout=120):
@@ -76,11 +114,44 @@ def ask_messages(messages, *, model=None, backend=None, timeout=120):
     CLI backend flattens them into a single ``claude -p`` prompt.
     """
     resolved = backend or _backend
-    if resolved == "mock":
-        return _mock(messages, model=model)
-    if resolved == "claude":
-        return _claude(messages, model=model, timeout=timeout)
-    raise ValueError(f"Unknown AI backend: {resolved!r} (expected one of {BACKENDS})")
+    req_id = _log_request(resolved, model, messages)
+    try:
+        if resolved == "mock":
+            response = _mock(messages, model=model)
+        elif resolved == "claude":
+            response = _claude(messages, model=model, timeout=timeout)
+        else:
+            raise ValueError(f"Unknown AI backend: {resolved!r} (expected one of {BACKENDS})")
+    except Exception as exc:
+        _log_error(req_id, exc)
+        raise
+    _log_response(req_id, response)
+    return response
+
+
+def _log_request(backend, model, messages):
+    """Append the outgoing prompt to the debug log; return its request id."""
+    global _seq
+    if _logger is None:
+        return None
+    _seq += 1
+    req_id = _seq
+    _logger.info("--- REQUEST #%d (backend=%s, model=%s) ---", req_id, backend, model or "default")
+    for m in messages:
+        _logger.info("[%s]\n%s", m.get("role", "?"), m.get("content", ""))
+    return req_id
+
+
+def _log_response(req_id, response):
+    if _logger is None:
+        return
+    _logger.info("--- RESPONSE #%s ---\n%s", req_id, response)
+
+
+def _log_error(req_id, exc):
+    if _logger is None:
+        return
+    _logger.error("--- ERROR #%s --- %r", req_id, exc)
 
 
 def ask(prompt, *, model=None, backend=None, timeout=120):

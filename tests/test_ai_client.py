@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Tests for white_wizard.ai_client. The real `claude` binary is never invoked."""
 
+import logging
+import os
+import shutil
+import tempfile
 import unittest
 from unittest import mock
 
@@ -59,6 +63,46 @@ class ClaudeBackendTests(unittest.TestCase):
              mock.patch("white_wizard.ai_client.subprocess.Popen", return_value=proc):
             with self.assertRaises(RuntimeError):
                 ai_client.ask("hi", backend="claude")
+
+
+class DebugLoggingTests(unittest.TestCase):
+    def setUp(self):
+        self.origin = os.getcwd()
+        self.tmp = tempfile.mkdtemp(prefix="ww_dbg_")
+        os.chdir(self.tmp)
+
+    def tearDown(self):
+        # Tear down the singleton logger so its file handle doesn't leak.
+        logger = logging.getLogger("white_wizard.debug")
+        for h in list(logger.handlers):
+            h.close()
+            logger.removeHandler(h)
+        ai_client._logger = None
+        ai_client._log_path = None
+        ai_client._seq = 0
+        os.chdir(self.origin)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_request_and_response_are_logged(self):
+        path = ai_client.enable_debug_logging()
+        with mock.patch.dict("os.environ",
+                             {"WHITE_WIZARD_MOCK_REPLY": "canned reply"}, clear=True):
+            ai_client.ask("trace me please", model="claude-opus-4-8")
+
+        with open(path) as f:
+            contents = f.read()
+        self.assertIn("REQUEST #1", contents)
+        self.assertIn("trace me please", contents)
+        self.assertIn("RESPONSE #1", contents)
+        self.assertIn("canned reply", contents)
+        self.assertTrue(path.endswith(os.path.join(".wizard", "debug.log")))
+
+    def test_no_log_file_without_debug(self):
+        # Without enable_debug_logging, ask() must not write a debug log.
+        with mock.patch.dict("os.environ",
+                             {"WHITE_WIZARD_MOCK_REPLY": "x"}, clear=True):
+            ai_client.ask("hello")
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, ".wizard", "debug.log")))
 
 
 if __name__ == "__main__":

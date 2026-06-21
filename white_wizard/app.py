@@ -14,8 +14,8 @@ import time
 from white_wizard.ai_client import ask, ask_with_history
 from white_wizard import db as wizard_db
 from white_wizard.ui import (
-    BOLD, DIM, WHITE, GOLD, CYAN, GRAY,
-    color, clear, show_header, read_key, Option, menu,
+    BOLD, DIM, WHITE, GOLD, CYAN, GRAY, DANGER, BRIGHT_BLUE,
+    color, clear, show_header, read_key, Option, menu, SPINNER_FRAMES,
 )
 
 # ---------------------------------------------------------------------------
@@ -23,6 +23,9 @@ from white_wizard.ui import (
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
+
+# Keep the build/infographic view up at least this long so it can be read.
+MIN_BUILD_DISPLAY_SECONDS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -39,26 +42,52 @@ def load_prompt(name):
 # Agent plan parsing and infographic
 # ---------------------------------------------------------------------------
 
+def _is_agent_plan(obj):
+    """True if obj is a dict with a non-empty list of named agent dicts."""
+    return (isinstance(obj, dict)
+            and isinstance(obj.get("agents"), list)
+            and obj["agents"]
+            and all(isinstance(a, dict) and a.get("name") for a in obj["agents"]))
+
+
 def parse_agent_plan(response):
     """Parse a valid agent plan from Claude's response, or return None.
 
     Only a dict with a non-empty ``agents`` list of named agent dicts counts as
     a plan. A bare JSON array/string/number — or agents missing a name — returns
     None so the caller treats it as "not a plan yet" instead of crashing.
+
+    Agent prompts routinely embed their own ``` fenced code blocks, so a
+    non-greedy ```json …``` match would stop at the first *inner* fence and
+    truncate the JSON. We match greedily to the last fence, and fall back to
+    scanning for the first brace-delimited object that decodes — which tolerates
+    nested fences, surrounding prose, and trailing text.
     """
-    m = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL)
-    candidates = [m.group(1)] if m else []
+    candidates = []
+    m = re.search(r'```(?:json)?\s*(.*)```', response, re.DOTALL)  # greedy: last fence
+    if m:
+        candidates.append(m.group(1).strip())
     candidates.append(response.strip())
     for candidate in candidates:
         try:
             obj = json.loads(candidate)
         except Exception:
             continue
-        if (isinstance(obj, dict)
-                and isinstance(obj.get("agents"), list)
-                and obj["agents"]
-                and all(isinstance(a, dict) and a.get("name") for a in obj["agents"])):
+        if _is_agent_plan(obj):
             return obj
+
+    # Fallback: let the JSON decoder find an object starting at each '{'. This
+    # parses the full object regardless of nested ``` or extra surrounding text.
+    decoder = json.JSONDecoder()
+    idx = response.find("{")
+    while idx != -1:
+        try:
+            obj, _ = decoder.raw_decode(response, idx)
+        except ValueError:
+            obj = None
+        if _is_agent_plan(obj):
+            return obj
+        idx = response.find("{", idx + 1)
     return None
 
 
@@ -537,7 +566,7 @@ def write_orchestration(plan, team_selection, model):
         _orchestrator_prompt(team_label, agents, transitions, sm_name),
     )
 
-    manifest = {
+    orch = {
         "created_at": datetime.date.today().isoformat(),
         "team": team_label,
         "team_folder": team_folder,
@@ -551,30 +580,81 @@ def write_orchestration(plan, team_selection, model):
         "mcp_tools": [sm_rel],
         "mcp_servers": [sm_name],
     }
-    with open(_manifest_path(), "w") as f:
-        json.dump(manifest, f, indent=2)
+    _save_orchestration(orch)  # merge into the manifest and make it active
 
     ensure_wizard_config(model)
     return team_dir
 
 
-def load_orchestration():
-    """Load the current orchestration from .claude/, or None.
+def _read_manifest():
+    """Read .claude/wizard-orch.json normalized to {"active", "orchestrations"}.
 
-    .claude/wizard-orch.json is the source of truth. Returns a dict shaped like
-    the old wizard.yaml orchestration entry, so callers stay unchanged.
+    Tolerates the legacy single-orchestration shape (a bare orch dict) and a
+    missing/corrupt file, so older projects keep working.
     """
     path = _manifest_path()
     if not os.path.isfile(path):
-        return None
+        return {"active": None, "orchestrations": []}
     try:
         with open(path) as f:
-            orch = json.load(f)
+            data = json.load(f)
     except Exception:
+        return {"active": None, "orchestrations": []}
+    if isinstance(data, dict) and isinstance(data.get("orchestrations"), list):
+        orchs = [o for o in data["orchestrations"] if isinstance(o, dict) and o.get("agents")]
+        return {"active": data.get("active"), "orchestrations": orchs}
+    if isinstance(data, dict) and data.get("agents"):          # legacy single orch
+        return {"active": data.get("team_folder"), "orchestrations": [data]}
+    return {"active": None, "orchestrations": []}
+
+
+def _write_manifest(manifest):
+    with open(_manifest_path(), "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def list_orchestrations():
+    """Every orchestration the wizard has built, in creation order."""
+    return _read_manifest()["orchestrations"]
+
+
+def load_orchestration():
+    """The active orchestration dict, or None.
+
+    The returned shape matches the old manifest entry, so existing callers
+    (stream mode, prompts, smoke test) stay unchanged — they just operate on
+    whichever orchestration is currently active.
+    """
+    m = _read_manifest()
+    orchs = m["orchestrations"]
+    if not orchs:
         return None
-    if not isinstance(orch, dict) or not orch.get("agents"):
-        return None
-    return orch
+    for o in orchs:
+        if o.get("team_folder") == m["active"]:
+            return o
+    return orchs[0]
+
+
+def _save_orchestration(orch):
+    """Insert/replace orch in the manifest (keyed by team_folder) and activate it."""
+    m = _read_manifest()
+    folder = orch.get("team_folder")
+    others = [o for o in m["orchestrations"] if o.get("team_folder") != folder]
+    _write_manifest({"active": folder, "orchestrations": others + [orch]})
+
+
+def set_active_orchestration(team_folder):
+    """Mark team_folder as the active orchestration, if it exists."""
+    m = _read_manifest()
+    if any(o.get("team_folder") == team_folder for o in m["orchestrations"]):
+        m["active"] = team_folder
+        _write_manifest(m)
+
+
+def _ordered_agent_names(orch):
+    """Subagent slugs in order of operations, derived from the transitions."""
+    names = [a.get("name") for a in orch.get("agents", []) if a.get("name")]
+    return _flow_order(names, orch.get("transitions", []))
 
 
 # ---------------------------------------------------------------------------
@@ -593,28 +673,43 @@ def _remove_path(path):
     return False
 
 
-def wipe_orchestration():
-    """Delete the orchestration the wizard produced. DESTRUCTIVE, no undo.
+def wipe_orchestration(team_folder=None):
+    """Delete one orchestration (the active one by default). DESTRUCTIVE, no undo.
 
-    For Claude the orchestration is the team's subagent folder(s) under
-    .claude/agents/<team>_team/ plus the manifest (.claude/wizard-orch.json) and
-    any MCP tools the wizard generated. The wizard's own config (wizard.yaml
-    settings + stream thoughts) is preserved.
+    Removes that team's subagent folder under .claude/agents/<team>_team/, the
+    MCP tools/servers it generated, and its manifest entry. Any remaining
+    orchestration becomes active (the manifest file is removed only when the last
+    one is wiped). The wizard's own config (wizard.yaml settings + stream
+    thoughts) is preserved. Returns the list of removed paths/labels.
     """
-    import glob
-    cwd  = os.getcwd()
-    orch = load_orchestration() or {}
+    cwd   = os.getcwd()
+    m     = _read_manifest()
+    orchs = m["orchestrations"]
+    if not orchs:
+        return []
 
-    targets = list(glob.glob(os.path.join(_agents_dir(), "*_team")))
-    targets.append(_manifest_path())
-    for rel in orch.get("mcp_tools", []):
-        targets.append(os.path.join(cwd, rel))
+    want   = team_folder or m["active"]
+    target = next((o for o in orchs if o.get("team_folder") == want), orchs[-1])
 
+    # Guard against empty paths: a blank team_folder would resolve to the whole
+    # .claude/agents dir (and a blank rel to cwd), which _remove_path would wipe.
+    targets = []
+    folder = target.get("team_folder")
+    if folder:
+        targets.append(os.path.join(_agents_dir(), folder))
+    targets += [os.path.join(cwd, rel) for rel in target.get("mcp_tools", []) if rel]
     removed = [os.path.relpath(p, cwd) for p in dict.fromkeys(targets) if _remove_path(p)]
 
-    # Unregister the wizard's MCP servers without clobbering any the user added.
-    if _unregister_mcp_servers(orch.get("mcp_servers", [])):
+    # Unregister this orchestration's MCP servers without clobbering user ones.
+    if _unregister_mcp_servers(target.get("mcp_servers", [])):
         removed.append(".mcp.json (entries removed)")
+
+    remaining = [o for o in orchs if o is not target]
+    if remaining:
+        _write_manifest({"active": remaining[-1].get("team_folder"),
+                         "orchestrations": remaining})
+    else:
+        _remove_path(_manifest_path())
 
     # Strip any legacy orchestrations from wizard.yaml (now lives in .claude/).
     data = load_wizard_yaml()
@@ -627,26 +722,36 @@ def wipe_orchestration():
 
 
 def _confirm_and_wipe():
-    """Confirm with a danger warning, then wipe. Returns True if anything was wiped."""
-    confirmed = yes_no(
-        "Wipe the orchestration system?\n\n"
-        "  DANGER: this permanently deletes the orchestration the wizard\n"
-        "  produced — the generated agent files and .claude/agents definitions.\n"
-        "  This cannot be undone. Your wizard.yaml settings are kept.\n\n"
-        "  Are you sure?"
+    """Confirm (with a danger warning) and wipe the active orchestration.
+
+    Returns True if anything was wiped.
+    """
+    name = (load_orchestration() or {}).get("team", "this orchestration")
+
+    def render_top():
+        print(color(f"  Wipe '{name}'?\n", BOLD, WHITE))
+        print(color("  DANGER: this permanently deletes the orchestration the wizard", BOLD, DANGER))
+        print(color("  produced — its generated agent files and .claude/agents definitions.", DANGER))
+        print(color("  This cannot be undone. Your wizard.yaml settings are kept.\n", DANGER))
+
+    value, _ = menu(
+        [Option(True, "Yes, wipe it"), Option(False, "No, keep it")],
+        title="Are you sure?",
+        hint="(arrows · Enter to choose)",
+        render_top=render_top,
     )
-    if not confirmed:
+    if value is not True:
         return False
 
     removed = wipe_orchestration()
     clear()
     show_header()
     if removed:
-        print(color("  Orchestration system wiped.\n", BOLD, GOLD))
+        print(color(f"  '{name}' wiped.\n", BOLD, GOLD))
         for item in removed:
             print(color(f"    - {item}", DIM, WHITE))
     else:
-        print(color("  Nothing to wipe — no orchestration system found.\n", DIM, WHITE))
+        print(color("  Nothing to wipe — no orchestration found.\n", DIM, WHITE))
     print()
     print(color("  Press any key to continue...", DIM, WHITE))
     read_key()
@@ -703,44 +808,72 @@ def _prompt_orchestration(user_prompt=None, task_mode=False):
     _show_wizard_response(response)
 
 
-def handle_wizard_yaml(path):
-    last = load_orchestration()
-    team = last.get("team", "team") if last else "team"
+def handle_wizard_yaml(path=None):
+    """The 'existing orchestrations' main menu.
 
-    task_label = f"What do you want the {team} to do?"
-    options = [
-        Option("task",   task_label, text_input=True, placeholder=task_label),
-        Option("manage", "Manage the system"),
-        Option("other",  "Something else", text_input=True,
-               placeholder="Something else"),
-        Option("stream", "Start streaming"),
-        Option("wipe",   "Wipe the orchestration system"),
-    ]
+    With more than one orchestration, shift+tab cycles the active one and the
+    panel updates (name, orchestrator, subagents in order of operations). The
+    active selection drives task/manage/stream/wipe. Returns "__refresh__" when
+    state changed (e.g. a wipe) so the caller re-evaluates, or None to quit.
+    """
+    orchs = list_orchestrations()
+    active = _read_manifest()["active"]
+    sel = {"i": next((i for i, o in enumerate(orchs)
+                      if o.get("team_folder") == active), 0)}
+
+    def current():
+        return orchs[sel["i"]] if orchs else None
 
     def render_top():
-        if last:
-            agents  = last.get("agents", [])
-            created = last.get("created_at", "")
-            print(color(f"  {team} orchestration  ·  {created}\n", BOLD, GOLD))
-            for a in agents:
-                print(color(f"    · {a['name']}", DIM, WHITE))
+        orch = current()
+        if orch:
+            pos = f"  [{sel['i'] + 1}/{len(orchs)}]" if len(orchs) > 1 else ""
+            print(color(f"  {orch.get('team', 'Orchestration')}{pos}", BOLD, GOLD)
+                  + color(f"   ·  {orch.get('created_at', '')}", DIM, WHITE))
+            print(color(f"  orchestrator: {orch.get('orchestrator', '')}", DIM, WHITE))
+            print(color("  subagents (in order):", DIM, WHITE))
+            for n, name in enumerate(_ordered_agent_names(orch), 1):
+                print(color(f"    {n}. {name}", WHITE))
+            if len(orchs) > 1:
+                print(color("\n  shift+tab — switch orchestration", DIM, BRIGHT_BLUE))
         else:
             print(color("  No orchestration in .claude/ yet.", DIM, WHITE))
         print()
 
     while True:
+        orch = current()
+        team = orch.get("team", "team") if orch else "team"
+        task_label = f"What do you want the {team} to do?"
+        options = [
+            Option("task",   task_label, text_input=True, placeholder=task_label),
+            Option("manage", "Manage the system"),
+            Option("other",  "Something else", text_input=True,
+                   placeholder="Something else"),
+            Option("stream", "Start streaming"),
+            Option("wipe",   "Wipe the orchestration system"),
+        ]
+        multi = len(orchs) > 1
+        extra = {"shift_tab": "__switch__"} if multi else {}
+        hint = ("(arrows · Enter to choose · shift+tab to switch · q to quit)" if multi
+                else "(arrows · Enter to choose · q to quit)")
+
         choice, text = menu(
             options,
-            hint="(arrows · Enter to choose · q to quit)",
+            hint=hint,
             render_top=render_top,
+            extra_keys=extra,
         )
+        if choice == "__switch__":
+            sel["i"] = (sel["i"] + 1) % len(orchs)
+            set_active_orchestration(current().get("team_folder"))
+            continue
         if choice is None:
             return None
         if choice == "stream":
             run_stream_mode()
         elif choice == "wipe":
             if _confirm_and_wipe():
-                return None
+                return "__refresh__"
         elif choice == "manage":
             _prompt_orchestration()
         elif choice == "task" and text:
@@ -768,7 +901,7 @@ def scan_workspace():
     clear()
     show_header()
 
-    spinner  = itertools.cycle("◆◈◇◈")
+    spinner  = itertools.cycle(SPINNER_FRAMES)
     files    = []
     walker   = os.walk(root)
     finished = False
@@ -788,7 +921,7 @@ def scan_workspace():
                 finished = True
         count = f"{len(files)} file{'s' if len(files) != 1 else ''}" if files else "0 files"
         sys.stdout.write(
-            "\r" + color(f"  {next(spinner)} ", GOLD)
+            "\r  " + next(spinner) + "  "
             + color(f"Scanning '{name}' for existing code... ", WHITE)
             + color(f"({count})", DIM, WHITE)
         )
@@ -848,31 +981,17 @@ def select(options, title,
 
 
 # ---------------------------------------------------------------------------
-# Simple yes/no prompt for offers
-# ---------------------------------------------------------------------------
-
-def yes_no(question):
-    """Display a two-option yes/no menu. Returns True for yes, False for no."""
-    value, _ = menu(
-        [Option(True, "Yes"), Option(False, "No")],
-        title=question,
-        hint="(arrows · Enter to choose)",
-    )
-    return value is True
-
-
-# ---------------------------------------------------------------------------
 # Loading / spinner
 # ---------------------------------------------------------------------------
 
 def loading(label, seconds=3.0):
-    spinner = itertools.cycle("◆◈◇◈")
+    spinner = itertools.cycle(SPINNER_FRAMES)
     end     = time.time() + seconds
     while time.time() < end:
-        sys.stdout.write("\r" + color(f"  {next(spinner)} ", GOLD) + color(label, WHITE))
+        sys.stdout.write("\r  " + next(spinner) + "  " + color(label, WHITE))
         sys.stdout.flush()
         time.sleep(0.09)
-    sys.stdout.write("\r" + " " * (len(label) + 6) + "\r")
+    sys.stdout.write("\r" + " " * (len(label) + 12) + "\r")
     sys.stdout.flush()
 
 
@@ -894,13 +1013,13 @@ def conjure(fn, *args, label="Conjuring magic...", **kwargs):
 
     threading.Thread(target=worker, daemon=True).start()
 
-    spinner = itertools.cycle("◆◈◇◈")
+    spinner = itertools.cycle(SPINNER_FRAMES)
     while not done.is_set():
-        sys.stdout.write("\r" + color(f"  {next(spinner)} ", GOLD) + color(label, WHITE))
+        sys.stdout.write("\r  " + next(spinner) + "  " + color(label, WHITE))
         sys.stdout.flush()
         time.sleep(0.09)
 
-    sys.stdout.write("\r" + " " * (len(label) + 6) + "\r")
+    sys.stdout.write("\r" + " " * (len(label) + 12) + "\r")
     sys.stdout.flush()
 
     if error[0]:
@@ -937,6 +1056,30 @@ TEAM_PROMPTS = {
 def parse_generated_files(response):
     pattern = r'### FILE: ([^\n]+)\n```[a-zA-Z]*\n(.*?)```'
     return [(p.strip(), c.strip()) for p, c in re.findall(pattern, response, re.DOTALL)]
+
+
+def _ensure_mcp():
+    """Make sure the `mcp` package (needed by the generated state machine) is
+    installed, installing it with pip if missing.
+
+    Returns (status, detail) where status is "ok" (already present), "installed"
+    (just installed), or "fail" (with a short reason in detail). Never raises —
+    a failed install degrades to a manual instruction in the summary.
+    """
+    import importlib.util
+    if importlib.util.find_spec("mcp") is not None:
+        return ("ok", "")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "mcp"],
+            capture_output=True, text=True,
+        )
+    except Exception as exc:
+        return ("fail", str(exc))
+    if proc.returncode == 0:
+        return ("installed", "")
+    out = (proc.stderr or proc.stdout).strip()
+    return ("fail", out.splitlines()[-1] if out else f"pip exited {proc.returncode}")
 
 
 def _smoke_test(team_dir, orch):
@@ -1013,7 +1156,8 @@ def _smoke_test(team_dir, orch):
     return all(passed for _, passed, _ in checks), checks
 
 
-def show_orchestration_created(team_selection, team_dir, smoke_ok=None, smoke_checks=None):
+def show_orchestration_created(team_selection, team_dir, smoke_ok=None, smoke_checks=None,
+                               mcp_status=None, mcp_detail=""):
     """Show the Claude-native subagent files that were written, smoke-test results, and how to run."""
     clear()
     show_header()
@@ -1035,14 +1179,21 @@ def show_orchestration_created(team_selection, team_dir, smoke_ok=None, smoke_ch
                 line += f" — {detail}"
             print(color(line, WHITE if passed else GRAY))
         print()
-    print(color("  To run your orchestration:", DIM, WHITE))
-    print(color("    pip install mcp   # the state-machine tool needs it", DIM, WHITE))
-    print(color("    open Claude in this project and invoke the orchestrator —", DIM, WHITE))
-    print(color(f"    e.g. ask Claude to use the '{orch.get('orchestrator', 'orchestrator')}' subagent.\n",
+    if mcp_status == "installed":
+        print(color("  ✓ MCP runtime installed (pip install mcp).", WHITE))
+    elif mcp_status == "ok":
+        print(color("  ✓ MCP runtime already present.", WHITE))
+    elif mcp_status == "fail":
+        print(color("  ! Could not auto-install the MCP runtime — install it manually:", GRAY))
+        print(color(f"      pip install mcp   ({mcp_detail})" if mcp_detail
+                    else "      pip install mcp", GRAY))
+    print()
+    print(color(f"  Lead orchestrator: {orch.get('orchestrator', 'orchestrator')}  "
+                "(delegates via the state-machine MCP tool)", DIM, WHITE))
+    print(color("  Your team is ready. Next you'll land at the prompt where you can", DIM, WHITE))
+    print(color("  give the team a task to run — or let the wizard prompt the AI for you.\n",
                 BOLD, GOLD))
-    print(color("  The orchestrator delegates via the generated state-machine MCP tool,", DIM, WHITE))
-    print(color("  so each subagent runs in the right order.\n", DIM, WHITE))
-    print(color("  Press any key to continue...", DIM, WHITE))
+    print(color("  Press any key to continue to the prompt...", DIM, WHITE))
     read_key()
 
 
@@ -1080,23 +1231,29 @@ def run_team_conversation(team_selection, synopsis, custom_description=""):
         read_key()
         return None
 
-    # Show the orchestration, then build it for them.
+    # Show the orchestration and build it for them, keeping the diagram on
+    # screen for at least 15s so it can actually be read.
     clear()
     show_header()
     print(render_infographic(plan, team_name=team_selection))
     print()
+    build_start = time.time()
+
     loading("Building the AI orchestration system...", seconds=2.0)
     team_dir = write_orchestration(plan, team_selection, DEFAULT_MODEL)
 
-    # Smoke-test the freshly built orchestration.
-    clear()
-    show_header()
-    print(color(f"  {team_selection.replace('Create ', '').title()} — orchestration built\n",
-                BOLD, CYAN))
+    # Install the MCP runtime the generated state machine depends on.
+    mcp_status, mcp_detail = conjure(
+        _ensure_mcp, label="Installing the MCP runtime (pip install mcp)...")
+
     loading("Running a smoke test on the orchestration...", seconds=1.6)
     ok, checks = _smoke_test(team_dir, load_orchestration() or {})
 
-    show_orchestration_created(team_selection, team_dir, ok, checks)
+    remaining = MIN_BUILD_DISPLAY_SECONDS - (time.time() - build_start)
+    if remaining > 0:
+        loading("Finalising the orchestration...", seconds=remaining)
+
+    show_orchestration_created(team_selection, team_dir, ok, checks, mcp_status, mcp_detail)
     return "done"
 
 
@@ -1465,49 +1622,46 @@ def run_stream_mode():
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    wizard_yaml = find_wizard_yaml()
-    if wizard_yaml:
-        result = handle_wizard_yaml(wizard_yaml)
-        if result is None:
-            print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
-        return
-
+def _first_menu():
+    """The 'no orchestrations yet' main menu: pick what to build. Returns "done"
+    after a successful build, or None if the user quit."""
     files = scan_workspace()
     if files:
-        selection = plan_with_ai(files)
-    else:
-        selection = None
-        while True:
-            choice = select(OPTIONS, "What shall we summon today?")
-            if choice is None:
-                break
-            if choice == "__stream__":
-                run_stream_mode()
-                continue
-            if choice not in OPTIONS:
-                # Free-form "Something else" query — answer and keep browsing.
-                _ask_and_show(choice)
-                continue
-            # A concrete build option in a fresh workspace: build it directly,
-            # with no synopsis since there is no existing code to analyse.
-            result = run_team_conversation(
-                choice, "(fresh workspace — no existing code yet)",
-                custom_description=choice,
-            )
-            if result is not None:
-                selection = result
-                break
+        return plan_with_ai(files)
 
-    if selection is None:
-        print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
-        return
+    while True:
+        choice = select(OPTIONS, "What shall we summon today?")
+        if choice is None:
+            return None
+        if choice == "__stream__":
+            run_stream_mode()
+            continue
+        if choice not in OPTIONS:
+            # Free-form "Something else" query — answer and keep browsing.
+            _ask_and_show(choice)
+            continue
+        # A concrete build option in a fresh workspace: build it directly,
+        # with no synopsis since there is no existing code to analyse.
+        result = run_team_conversation(
+            choice, "(fresh workspace — no existing code yet)",
+            custom_description=choice,
+        )
+        if result is not None:
+            return result
 
-    if selection == "done":
-        wizard_yaml = find_wizard_yaml()
-        if wizard_yaml:
-            result = handle_wizard_yaml(wizard_yaml)
-            if result is None:
-                print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
-    else:
-        print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
+
+def main():
+    # Two main menus: the existing-orchestrations menu when one or more have been
+    # built (switch/task/wipe), else the build menu. Looping between them means a
+    # wipe or a build lands back on the right menu instead of exiting.
+    while True:
+        if load_orchestration():
+            if handle_wizard_yaml() == "__refresh__":
+                continue            # wiped → re-evaluate (other orch, or build menu)
+            break                   # user quit
+        else:
+            if _first_menu() is None:
+                break               # user quit the build menu
+            # built something → loop → existing-orchestrations menu
+
+    print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
