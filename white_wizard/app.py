@@ -848,36 +848,6 @@ def select(options, title,
 
 
 # ---------------------------------------------------------------------------
-# Approval menu
-# ---------------------------------------------------------------------------
-
-APPROVAL_YES    = "Yes, proceed"
-APPROVAL_NO     = "No, start over"
-APPROVAL_DETAIL = "No, "
-
-
-def approval_select(content=""):
-    """Approve / start over / give feedback. Returns ("yes"|"no"|"detail", text)."""
-    opts = [
-        Option("yes",    APPROVAL_YES),
-        Option("no",     APPROVAL_NO),
-        Option("detail", APPROVAL_DETAIL, text_input=True,
-               prefix=color("No, ", GRAY)),
-    ]
-    value, text = menu(
-        opts,
-        title="Does this look right?",
-        hint="(arrows to move · type feedback on last option · Enter to choose)",
-        render_top=(lambda: print(content)) if content else None,
-    )
-    if value == "detail":
-        return ("detail", text or "no feedback given")
-    if value is None:
-        return ("no", "")
-    return (value, "")
-
-
-# ---------------------------------------------------------------------------
 # Simple yes/no prompt for offers
 # ---------------------------------------------------------------------------
 
@@ -969,8 +939,80 @@ def parse_generated_files(response):
     return [(p.strip(), c.strip()) for p, c in re.findall(pattern, response, re.DOTALL)]
 
 
-def show_orchestration_created(team_selection, team_dir):
-    """Show the Claude-native subagent files that were written, and how to run."""
+def _smoke_test(team_dir, orch):
+    """Validate the freshly built orchestration. Returns (ok, [(label, passed, detail)])."""
+    import ast
+    checks = []
+    agents = [a["name"] for a in orch.get("agents", [])]
+
+    # 1. Every subagent (specialists + orchestrator) has a file with frontmatter.
+    missing = []
+    for name in agents + [orch.get("orchestrator", "")]:
+        if not name:
+            continue
+        p = os.path.join(team_dir, name + ".md")
+        if not os.path.isfile(p):
+            missing.append(name)
+            continue
+        head = open(p).read()
+        if not (head.lstrip().startswith("---") and "name:" in head and "description:" in head):
+            missing.append(name + " (frontmatter)")
+    checks.append(("Subagent files and frontmatter", not missing, ", ".join(missing)))
+
+    # 2. The state-machine MCP tool is syntactically valid.
+    sm = os.path.join(team_dir, "state_machine.py")
+    sm_ok = os.path.isfile(sm)
+    sm_detail = "" if sm_ok else "state_machine.py missing"
+    if sm_ok:
+        try:
+            ast.parse(open(sm).read())
+        except SyntaxError as exc:
+            sm_ok, sm_detail = False, str(exc)
+    checks.append(("State-machine tool valid", sm_ok, sm_detail))
+
+    # 3. Transitions reference real agents (or 'done').
+    known = set(agents) | {"done"}
+    trans = orch.get("transitions", [])
+    bad = [f"{t.get('from')}→{t.get('to')}"
+           for t in trans
+           if t.get("to") not in known or t.get("from") not in set(agents)]
+    checks.append(("Transitions reference real agents", not bad, ", ".join(bad)))
+
+    # 4. Following pass/always edges from the start reaches 'done'.
+    fwd = {}
+    for t in trans:
+        if t.get("condition") in ("pass", "always") and t.get("from") not in fwd:
+            fwd[t["from"]] = t.get("to")
+    cur, seen, reached = (agents[0] if agents else "done"), set(), False
+    for _ in range(len(agents) + 2):
+        if cur == "done":
+            reached = True
+            break
+        if cur in seen:
+            break
+        seen.add(cur)
+        cur = fwd.get(cur)
+        if cur is None:
+            break
+    checks.append(("Flow reaches 'done'", reached, "" if reached else f"stuck at {cur}"))
+
+    # 5. The state-machine server is registered in .mcp.json.
+    reg = False
+    mp = os.path.join(os.getcwd(), ".mcp.json")
+    if os.path.isfile(mp):
+        try:
+            with open(mp) as f:
+                servers = json.load(f).get("mcpServers", {})
+            reg = all(s in servers for s in orch.get("mcp_servers", []))
+        except Exception:
+            reg = False
+    checks.append(("MCP server registered", reg, ""))
+
+    return all(passed for _, passed, _ in checks), checks
+
+
+def show_orchestration_created(team_selection, team_dir, smoke_ok=None, smoke_checks=None):
+    """Show the Claude-native subagent files that were written, smoke-test results, and how to run."""
     clear()
     show_header()
     team_label = team_selection.replace("Create ", "").title()
@@ -982,6 +1024,15 @@ def show_orchestration_created(team_selection, team_dir):
     for name in sorted(os.listdir(team_dir)):
         print(color(f"    {name}", WHITE))
     print()
+    if smoke_checks is not None:
+        print(color(f"  Smoke test {'passed' if smoke_ok else 'found issues'}:",
+                    BOLD, GOLD if smoke_ok else GRAY))
+        for label, passed, detail in smoke_checks:
+            line = f"    {'✓' if passed else '✗'} {label}"
+            if detail and not passed:
+                line += f" — {detail}"
+            print(color(line, WHITE if passed else GRAY))
+        print()
     print(color("  To run your orchestration:", DIM, WHITE))
     print(color("    pip install mcp   # the state-machine tool needs it", DIM, WHITE))
     print(color("    open Claude in this project and invoke the orchestrator —", DIM, WHITE))
@@ -1012,41 +1063,49 @@ def run_team_conversation(team_selection, synopsis, custom_description=""):
     initial_prompt  = (template + "\n" + guidelines
                        + "\n\n## Project context\n" + synopsis)
 
-    history = []
-    current = initial_prompt
-
-    while True:
+    # Generate the plan — auto-retry until it parses; the wizard builds it for
+    # the user rather than asking for approval.
+    history, current, plan, response = [], initial_prompt, None, ""
+    for _ in range(4):
         response = conjure(ask_with_history, history, current,
-                           label="Conjuring magic...", model=DEFAULT_MODEL)
+                           label="Conjuring the orchestration...", model=DEFAULT_MODEL)
         history.append(("user", current))
         history.append(("assistant", response))
-
         plan = parse_agent_plan(response)
-
         if plan:
-            content = render_infographic(plan, team_name=team_selection)
-        else:
-            lines = [color("  " + "─" * 50, DIM, WHITE)]
-            for line in response.splitlines():
-                lines.append(color("  " + line, WHITE))
-            lines.append(color("  " + "─" * 50, DIM, WHITE))
-            lines.append("")
-            content = "\n".join(lines)
+            break
+        current = ("Please return the agent plan now as a single JSON code block "
+                   "in the required format, with no other text.")
 
-        action, detail = approval_select(content=content)
+    if not plan:
+        clear()
+        show_header()
+        print(color("  The wizard could not produce an orchestration plan.\n", BOLD, GOLD))
+        for line in response.splitlines():
+            print(color("  " + line, WHITE))
+        print()
+        print(color("  Press any key to continue...", DIM, WHITE))
+        read_key()
+        return None
 
-        if action == "yes":
-            if plan:
-                team_dir = write_orchestration(plan, team_selection, DEFAULT_MODEL)
-                show_orchestration_created(team_selection, team_dir)
-                return "done"
-            else:
-                current = ("Please proceed and return the agent plan now "
-                           "in the required JSON format.")
-        elif action == "no":
-            return None
-        else:
-            current = f"Please revise the plan with this feedback: {detail}"
+    # Show the orchestration, then build it for them.
+    clear()
+    show_header()
+    print(render_infographic(plan, team_name=team_selection))
+    print()
+    loading("Building the AI orchestration system...", seconds=2.0)
+    team_dir = write_orchestration(plan, team_selection, DEFAULT_MODEL)
+
+    # Smoke-test the freshly built orchestration.
+    clear()
+    show_header()
+    print(color(f"  {team_selection.replace('Create ', '').title()} — orchestration built\n",
+                BOLD, CYAN))
+    loading("Running a smoke test on the orchestration...", seconds=1.6)
+    ok, checks = _smoke_test(team_dir, load_orchestration() or {})
+
+    show_orchestration_created(team_selection, team_dir, ok, checks)
+    return "done"
 
 
 def plan_with_ai(files):
