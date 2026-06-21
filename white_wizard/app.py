@@ -556,7 +556,10 @@ def write_orchestration(plan, team_selection, model):
     with open(sm_path, "w") as f:
         f.write(_state_machine_server(sm_name, team_label, start, transitions))
     sm_rel = os.path.relpath(sm_path, os.getcwd())
-    _register_mcp_server(sm_name, ["python3", sm_rel])
+    # Run the server with the same interpreter the wizard uses — that's where
+    # `mcp` gets installed (_ensure_mcp), so the tool works without the user
+    # having to fix their python3/PATH.
+    _register_mcp_server(sm_name, [sys.executable, sm_rel])
 
     orch_name = base + "-orchestrator"
     _write_subagent(

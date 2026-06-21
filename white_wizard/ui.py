@@ -83,6 +83,13 @@ def read_key():
     import termios
     import tty
 
+    # Without a real terminal (piped input, some CI/IDE shells) raw mode and
+    # termios calls fail; degrade to a line read so "press any key" screens and
+    # cancels don't crash with an opaque termios error.
+    if not sys.stdin.isatty():
+        ch = sys.stdin.read(1)
+        return "enter" if ch else "esc"
+
     fd  = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:

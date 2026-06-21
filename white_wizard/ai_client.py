@@ -102,6 +102,9 @@ def parse_args(argv=None):
     if debug:
         argv.remove("--debug")
         enable_debug_logging()
+    if argv:  # anything left is unrecognized
+        print(f"Warning: ignoring unrecognized option(s): {' '.join(argv)}",
+              file=sys.stderr)
     return {"stream": stream, "debug": debug}
 
 
@@ -169,12 +172,46 @@ def ask_with_history(history, new_message, *, model=None, backend=None, timeout=
     return ask_messages(messages, model=model, backend=backend, timeout=timeout)
 
 
+# A valid agent plan the mock returns when a plan is requested, so running the
+# wizard against the mock backend actually builds an orchestration (files on
+# disk) instead of dead-ending. The planner prompt embeds a ``` fence on purpose
+# to exercise the plan parser's nested-fence handling end to end.
+_MOCK_PLAN = """\
+Here is the dev team plan.
+
+```json
+{
+  "agents": [
+    {"name": "planner", "description": "Plans the work. Use first.",
+     "tools": ["Read", "Grep"],
+     "prompt": "You are the planner.\\n\\nWhen invoked:\\n1. Break the request into steps.\\n\\nOutput:\\n```\\nPLAN\\n1. step\\n```\\nReport the plan."},
+    {"name": "implementer", "description": "Writes code. Use after planning.",
+     "tools": ["Read", "Write", "Bash"],
+     "prompt": "You are the implementer."},
+    {"name": "reviewer", "description": "Reviews code. Use proactively after code is written.",
+     "prompt": "You are the reviewer."}
+  ],
+  "transitions": [
+    {"from": "planner", "to": "implementer", "condition": "always"},
+    {"from": "implementer", "to": "reviewer", "condition": "pass"},
+    {"from": "reviewer", "to": "planner", "condition": "fail"},
+    {"from": "reviewer", "to": "done", "condition": "pass"}
+  ]
+}
+```
+"""
+
+
 def _mock(messages, *, model=None):
     override = os.environ.get("WHITE_WIZARD_MOCK_REPLY")
     if override is not None:
         return override
-    name = model or "mock-model"
     last = messages[-1]["content"] if messages else ""
+    # When the wizard asks for an agent plan, return a real one so the build
+    # path runs to completion against the mock backend.
+    if "agent plan" in last.lower():
+        return _MOCK_PLAN
+    name = model or "mock-model"
     first = next((ln for ln in last.strip().splitlines() if ln.strip()), "(empty prompt)")
     return (f"[mock:{name}] Simulated AI response. You asked: {first.strip()[:200]}")
 

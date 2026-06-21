@@ -19,6 +19,7 @@ from unittest import mock
 
 from white_wizard import app
 from white_wizard import db as wizard_db
+from white_wizard import ui
 
 from tests.test_integration import CANNED_PLAN, ScriptedMenu
 
@@ -112,6 +113,17 @@ class EnsureMcpTest(unittest.TestCase):
             status, detail = app._ensure_mcp()
         self.assertEqual(status, "fail")
         self.assertEqual(detail, "ERROR: nope")
+
+
+class ReadKeyNonTtyTest(unittest.TestCase):
+    def test_non_tty_returns_enter_without_crashing(self):
+        # Regression: read_key() used to raise termios.error on piped/non-tty stdin.
+        with mock.patch.object(ui.sys, "stdin", io.StringIO("x")):
+            self.assertEqual(ui.read_key(), "enter")
+
+    def test_non_tty_eof_returns_esc(self):
+        with mock.patch.object(ui.sys, "stdin", io.StringIO("")):
+            self.assertEqual(ui.read_key(), "esc")
 
 
 class MultiOrchestrationStoreTest(unittest.TestCase):
@@ -310,6 +322,41 @@ class MainRedirectAfterWipeTest(unittest.TestCase):
         self.assertEqual(len(handle_calls), 1)
         self.assertEqual(len(first_calls), 1)  # redirected to the create menu
         self.assertEqual(app.list_orchestrations(), [])
+
+
+class RealMockBuildTest(unittest.TestCase):
+    """Against the real mock backend (no injected reply), the build must create
+    orchestration files — i.e. the mock returns a usable agent plan."""
+
+    def setUp(self):
+        self.origin = os.getcwd()
+        self.tmp = tempfile.mkdtemp(prefix="ww_realmock_")
+        os.chdir(self.tmp)
+        self.menu = ScriptedMenu()
+        self._patches = [
+            mock.patch.dict(os.environ, {}, clear=True),  # no WHITE_WIZARD_MOCK_REPLY
+            mock.patch.object(app, "menu", self.menu),
+            mock.patch.object(app, "read_key", lambda: "enter"),
+            mock.patch.object(app, "loading", lambda *a, **k: None),
+            mock.patch.object(app, "_ensure_mcp", lambda *a, **k: ("ok", "")),
+            mock.patch.object(app.time, "sleep", lambda *a, **k: None),
+        ]
+        for p in self._patches:
+            p.start()
+        wizard_db.init_db()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+        os.chdir(self.origin)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_build_with_real_mock_creates_files(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            app.main()
+        self.assertTrue(glob.glob(os.path.join(self.tmp, ".claude", "agents", "*_team")),
+                        "real mock backend did not build an orchestration")
+        self.assertTrue(os.path.isfile(os.path.join(self.tmp, ".claude", "wizard-orch.json")))
 
 
 class FreshWorkspaceBuildTest(unittest.TestCase):

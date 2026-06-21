@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Tests for white_wizard.ai_client. The real `claude` binary is never invoked."""
 
+import contextlib
+import io
 import logging
 import os
 import shutil
@@ -31,6 +33,43 @@ class MockBackendTests(unittest.TestCase):
     def test_unknown_backend_raises(self):
         with self.assertRaises(ValueError):
             ai_client.ask("hi", backend="gpt-bogus")
+
+    def test_mock_returns_buildable_plan_for_plan_prompt(self):
+        from white_wizard import app
+        with mock.patch.dict("os.environ", {}, clear=True):
+            reply = ai_client.ask("Otherwise return the agent plan as JSON.", backend="mock")
+        plan = app.parse_agent_plan(reply)
+        self.assertIsNotNone(plan)
+        self.assertTrue(plan["agents"] and all(a.get("name") for a in plan["agents"]))
+
+    def test_mock_echoes_for_non_plan_prompt(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            reply = ai_client.ask("Summarize this codebase please.", backend="mock")
+        self.assertIn("Simulated AI response", reply)
+
+
+class ParseArgsTests(unittest.TestCase):
+    def test_warns_on_unrecognized_flag(self):
+        saved = ai_client._backend
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                ai_client.parse_args(["--bogus"])
+            self.assertIn("unrecognized", err.getvalue())
+            self.assertIn("--bogus", err.getvalue())
+        finally:
+            ai_client._backend = saved
+
+    def test_no_warning_for_known_flags(self):
+        saved = ai_client._backend
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                flags = ai_client.parse_args(["--mock", "--stream"])
+            self.assertEqual(err.getvalue(), "")
+            self.assertTrue(flags["stream"])
+        finally:
+            ai_client._backend = saved
 
 
 class ClaudeBackendTests(unittest.TestCase):
