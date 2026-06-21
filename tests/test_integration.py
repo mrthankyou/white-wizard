@@ -83,6 +83,7 @@ class OrchestrationLifecycleTest(unittest.TestCase):
             mock.patch.object(app, "menu", self.menu),
             mock.patch.object(app, "read_key", lambda: "enter"),
             mock.patch.object(app, "loading", lambda *a, **k: None),
+            mock.patch.object(app, "_ensure_mcp", lambda *a, **k: ("ok", "")),
             mock.patch.object(app.time, "sleep", lambda *a, **k: None),
         ]
         for p in self._patches:
