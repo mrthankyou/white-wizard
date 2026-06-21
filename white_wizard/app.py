@@ -680,11 +680,11 @@ def _prompt_orchestration(user_prompt=None, task_mode=False):
     """Call Claude with the orchestration context and display the response."""
     orch      = load_orchestration() or {}
     orch_json = json.dumps(orch, indent=2)
-    team      = orch.get("team", "dev")
+    team      = orch.get("team", "dev team")
 
     if task_mode and user_prompt:
         prompt = (
-            f"You are the orchestrator for a multi-agent {team} team.\n\n"
+            f"You are the orchestrator for a multi-agent {team}.\n\n"
             f"The user wants the team to: {user_prompt}\n\n"
             f"Based on the plan below, outline which agents should handle this task, "
             f"in what order, and what each agent should specifically do.\n\n"
@@ -705,9 +705,9 @@ def _prompt_orchestration(user_prompt=None, task_mode=False):
 
 def handle_wizard_yaml(path):
     last = load_orchestration()
-    team = last.get("team", "Dev") if last else "Dev"
+    team = last.get("team", "team") if last else "team"
 
-    task_label = f"What do you want the {team} team to do?"
+    task_label = f"What do you want the {team} to do?"
     options = [
         Option("task",   task_label, text_input=True, placeholder=task_label),
         Option("manage", "Manage the system"),
@@ -1357,11 +1357,20 @@ def _wizard_route(answer, current_q, remaining):
 
 
 def _load_stream_thoughts(data):
-    """Read stream thoughts from wizard.yaml, accepting the legacy 'questions' key."""
-    stream = data.get("stream", {})
+    """Read stream thoughts from wizard.yaml, accepting the legacy 'questions' key.
+
+    wizard.yaml is hand-editable, so tolerate a malformed ``stream`` section
+    (non-dict, or a non-list thoughts value) by falling back to the defaults
+    instead of crashing.
+    """
+    stream = data.get("stream") if isinstance(data, dict) else None
+    if not isinstance(stream, dict):
+        stream = {}
     raw = stream.get("thoughts")
     if raw is None:
         raw = stream.get("questions", DEFAULT_STREAM_THOUGHTS)
+    if not isinstance(raw, list):
+        raw = DEFAULT_STREAM_THOUGHTS
     thoughts = [q for q in raw if _valid_thought(q)]
     return thoughts or list(DEFAULT_STREAM_THOUGHTS)
 
@@ -1468,15 +1477,27 @@ def main():
     if files:
         selection = plan_with_ai(files)
     else:
+        selection = None
         while True:
-            selection = select(OPTIONS, "What shall we summon today?")
-            if selection == "__stream__":
+            choice = select(OPTIONS, "What shall we summon today?")
+            if choice is None:
+                break
+            if choice == "__stream__":
                 run_stream_mode()
                 continue
-            if selection is not None and selection not in OPTIONS:
-                _ask_and_show(selection)
+            if choice not in OPTIONS:
+                # Free-form "Something else" query — answer and keep browsing.
+                _ask_and_show(choice)
                 continue
-            break
+            # A concrete build option in a fresh workspace: build it directly,
+            # with no synopsis since there is no existing code to analyse.
+            result = run_team_conversation(
+                choice, "(fresh workspace — no existing code yet)",
+                custom_description=choice,
+            )
+            if result is not None:
+                selection = result
+                break
 
     if selection is None:
         print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
