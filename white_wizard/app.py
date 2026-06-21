@@ -925,7 +925,8 @@ def scan_workspace():
         sys.stdout.flush()
         time.sleep(0.08)
 
-    sys.stdout.write("\r" + " " * 64 + "\r")
+    clear_w = 9 + len(f"Scanning '{name}' for existing code... ") + len(count) + 2
+    sys.stdout.write("\r" + " " * clear_w + "\r")
     if files:
         plural = "s" if len(files) != 1 else ""
         print(color(f"  + Found {len(files)} code file{plural} in this workspace.", BOLD, GOLD))
