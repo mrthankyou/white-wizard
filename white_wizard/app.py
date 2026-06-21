@@ -954,7 +954,8 @@ def _smoke_test(team_dir, orch):
         if not os.path.isfile(p):
             missing.append(name)
             continue
-        head = open(p).read()
+        with open(p) as f:
+            head = f.read()
         if not (head.lstrip().startswith("---") and "name:" in head and "description:" in head):
             missing.append(name + " (frontmatter)")
     checks.append(("Subagent files and frontmatter", not missing, ", ".join(missing)))
@@ -965,7 +966,8 @@ def _smoke_test(team_dir, orch):
     sm_detail = "" if sm_ok else "state_machine.py missing"
     if sm_ok:
         try:
-            ast.parse(open(sm).read())
+            with open(sm) as f:
+                ast.parse(f.read())
         except SyntaxError as exc:
             sm_ok, sm_detail = False, str(exc)
     checks.append(("State-machine tool valid", sm_ok, sm_detail))
@@ -1044,16 +1046,6 @@ def show_orchestration_created(team_selection, team_dir, smoke_ok=None, smoke_ch
     read_key()
 
 
-def display_synopsis(synopsis):
-    clear()
-    show_header()
-    print(color("  Project synopsis", BOLD, CYAN))
-    print(color("  " + "-" * 50, DIM, WHITE))
-    for line in synopsis.splitlines():
-        print(color("  " + line, WHITE))
-    print()
-
-
 def run_team_conversation(team_selection, synopsis, custom_description=""):
     prompt_file     = TEAM_PROMPTS.get(team_selection, "team_custom.md")
     template        = load_prompt(prompt_file)
@@ -1111,9 +1103,6 @@ def run_team_conversation(team_selection, synopsis, custom_description=""):
 def plan_with_ai(files):
     prompt  = load_prompt("analyze_codebase.md") + "\n".join(files[:60])
     synopsis = conjure(ask, prompt, label="Analysing codebase...", model=DEFAULT_MODEL)
-
-    display_synopsis(synopsis)
-    time.sleep(0.6)
 
     while True:
         team = select(ORCH_TYPES, "Which team do you want to set up?")
