@@ -1,10 +1,12 @@
 """SQLite state layer for White Wizard.
 
 All runtime/operational data lives in .wizard/state.db in the project directory.
-Config (stream questions, orchestration plans) stays in wizard.yaml.
+The wizard's own config (settings, stream thoughts) stays in wizard.yaml; the
+orchestration itself lives in the AI's native store (.claude/ for Claude).
 """
 import os
 import sqlite3
+from contextlib import contextmanager
 
 
 def _db_path():
@@ -19,9 +21,25 @@ def _connect():
     return conn
 
 
+@contextmanager
+def _session():
+    """Yield a connection that commits on success and is always closed.
+
+    sqlite3's own ``with conn:`` only manages the transaction (commit/rollback)
+    — it never closes the connection, which leaked a handle on every call. This
+    wraps that transaction context and guarantees ``close()`` runs.
+    """
+    conn = _connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 def init_db():
     """Create tables if they don't exist."""
-    with _connect() as conn:
+    with _session() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS stream_runs (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,19 +52,25 @@ def init_db():
             CREATE TABLE IF NOT EXISTS stream_findings (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id      INTEGER NOT NULL REFERENCES stream_runs(id),
-                question_id TEXT NOT NULL,
+                thought_id  TEXT NOT NULL,
                 priority    INTEGER NOT NULL,
                 response    TEXT NOT NULL,
                 approved    INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT NOT NULL
             );
         """)
+        # Migrate pre-existing DBs that still use the old column name.
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(stream_findings)")]
+        if "question_id" in cols and "thought_id" not in cols:
+            conn.execute(
+                "ALTER TABLE stream_findings RENAME COLUMN question_id TO thought_id"
+            )
 
 
 def start_stream_run(commit_hash, git_diff):
     """Insert a new stream run row and return its id."""
     init_db()
-    with _connect() as conn:
+    with _session() as conn:
         cur = conn.execute(
             "INSERT INTO stream_runs (started_at, commit_hash, git_diff) "
             "VALUES (datetime('now'), ?, ?)",
@@ -57,7 +81,7 @@ def start_stream_run(commit_hash, git_diff):
 
 def finish_stream_run(run_id, commit_hash):
     """Mark a run as finished and record the scanned commit."""
-    with _connect() as conn:
+    with _session() as conn:
         conn.execute(
             "UPDATE stream_runs SET finished_at = datetime('now'), commit_hash = ? "
             "WHERE id = ?",
@@ -65,14 +89,14 @@ def finish_stream_run(run_id, commit_hash):
         )
 
 
-def save_finding(run_id, question_id, priority, response, approved):
-    """Persist a stream finding."""
-    with _connect() as conn:
+def save_finding(run_id, thought_id, priority, response, approved):
+    """Persist a stream finding (the reviewed orchestration/code text)."""
+    with _session() as conn:
         conn.execute(
             "INSERT INTO stream_findings "
-            "(run_id, question_id, priority, response, approved, created_at) "
+            "(run_id, thought_id, priority, response, approved, created_at) "
             "VALUES (?, ?, ?, ?, ?, datetime('now'))",
-            (run_id, question_id, priority, response, int(approved)),
+            (run_id, thought_id, priority, response, int(approved)),
         )
 
 
@@ -80,7 +104,7 @@ def get_last_scanned_commit():
     """Return the commit hash from the most recent finished stream run, or None."""
     try:
         init_db()
-        with _connect() as conn:
+        with _session() as conn:
             row = conn.execute(
                 "SELECT commit_hash FROM stream_runs "
                 "WHERE finished_at IS NOT NULL "
@@ -95,7 +119,7 @@ def get_stream_stats():
     """Return a dict with summary stats for display."""
     try:
         init_db()
-        with _connect() as conn:
+        with _session() as conn:
             runs = conn.execute("SELECT COUNT(*) FROM stream_runs WHERE finished_at IS NOT NULL").fetchone()[0]
             findings = conn.execute("SELECT COUNT(*) FROM stream_findings WHERE approved = 1").fetchone()[0]
             last = conn.execute(

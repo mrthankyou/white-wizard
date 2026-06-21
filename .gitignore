@@ -8,3 +8,4 @@ todo.md
 .wizard/
 *.egg-info/
 dist/
+tests/fixtures/

@@ -13,51 +13,16 @@ import time
 
 from white_wizard.ai_client import ask, ask_with_history
 from white_wizard import db as wizard_db
+from white_wizard.ui import (
+    BOLD, DIM, WHITE, GOLD, CYAN, GRAY,
+    color, clear, show_header, read_key, Option, menu,
+)
 
 # ---------------------------------------------------------------------------
-# Presentation
+# Constants (terminal primitives + the menu engine live in white_wizard.ui)
 # ---------------------------------------------------------------------------
-
-RESET = "\033[0m"
-BOLD  = "\033[1m"
-DIM   = "\033[2m"
-REV   = "\033[7m"
-BLINK = "\033[5m"
-WHITE = "\033[97m"
-GOLD  = "\033[96m"
-CYAN  = "\033[36m"
-GRAY  = "\033[90m"
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
-MCP_NAME      = "wizard-state-machine"
-
-WIZARD = r"""
-                /\
-               /  \
-              / ** \
-             /  *   \
-            /   **   \
-           /  *    *  \
-          /     **    \
-         /____________ \
-    ____/______________\____
-   (________________________)
-"""
-
-
-def color(text, *codes):
-    return "".join(codes) + text + RESET
-
-
-def clear():
-    print("\033[2J\033[H", end="")
-
-
-def show_header():
-    print(color(WIZARD, BOLD, WHITE))
-    print(color("              The White Wizard", BOLD, GOLD))
-    print(color("   Conjure multi-agent orchestration with a single button.", DIM, WHITE))
-    print()
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +164,7 @@ def render_infographic(plan, team_name=""):
     box_h    = max(max_desc + 7, 9)
     rendered = [
         _make_box(d["name"], d["lines"], box_w, box_h,
-                  model=DEFAULT_MODEL, mcp=MCP_NAME)
+                  model=DEFAULT_MODEL, mcp=None)
         for d in box_data
     ]
 
@@ -247,33 +212,65 @@ def render_infographic(plan, team_name=""):
 # wizard.yaml helpers
 # ---------------------------------------------------------------------------
 
-DEFAULT_STREAM_QUESTIONS = [
+# Stream mode maintains; it does not build. Every thought serves one of two
+# axes: PRIMARY — keep the AI orchestration system healthy; SECONDARY — maintain
+# the codebase via refactors and bug fixes (never new features).
+DEFAULT_STREAM_THOUGHTS = [
+    # Primary axis — the AI orchestration system.
     {
         "priority": 1,
         "id": "orch_drift",
         "prompt": (
-            "Review the git diff and latest code. Have there been any changes to the "
-            "codebase that require updating how the orchestration system works, or that "
-            "expose missing components necessary to the success and evolution of the codebase?"
+            "PRIMARY FOCUS — the AI orchestration system. Review the latest code "
+            "and git diff against the current orchestration. Has the codebase "
+            "changed in a way that the agent team should change to stay aligned? "
+            "Are any subagents now missing, overlapping, or mis-scoped? Propose "
+            "orchestration updates only — do not propose new product features."
         ),
     },
     {
         "priority": 2,
+        "id": "mcp_optimization",
+        "prompt": (
+            "PRIMARY FOCUS — the AI orchestration system. Look across the "
+            "orchestration's subagents. Do several of them run the same command "
+            "(build, test, lint, deploy, a query) or repeat the same multi-step "
+            "procedure? If so, that command is a candidate to become a dedicated "
+            "MCP tool the subagents call directly. If you find a good one, build "
+            "the MCP tool and update the subagents that used the raw command to "
+            "use it instead."
+        ),
+    },
+    # Secondary axis — codebase maintenance (refactor + fix, never new features).
+    {
+        "priority": 3,
         "id": "bug_scan",
         "prompt": (
-            "Are there any bugs present in the codebase that should be surfaced "
-            "as a proposed bug fix?"
+            "SECONDARY FOCUS — codebase maintenance. Are there any bugs in the "
+            "codebase that should be surfaced as a proposed fix? Maintenance only "
+            "— do not propose new features."
         ),
     },
     {
-        "priority": 3,
+        "priority": 4,
+        "id": "code_health",
+        "prompt": (
+            "SECONDARY FOCUS — codebase maintenance. Is there old, duplicated, "
+            "dead, or overly complex code worth refactoring for maintainability "
+            "and simplicity? Propose maintenance refactors only — never new "
+            "features, and do not add complexity."
+        ),
+    },
+    # Meta — let stream mode improve its own thoughts.
+    {
+        "priority": 5,
         "id": "stream_self_improve",
         "prompt": (
-            "Review the questions currently saved in stream mode (wizard.yaml). "
-            "Are any improvements, new questions, or refactorings needed to better "
-            "identify issues, streamline codebase management, and simplify processes "
-            "— without unnecessarily adding complexity? If so, return the revised "
-            "question list as a JSON code block."
+            "Review the thoughts currently saved in stream mode (wizard.yaml). "
+            "Are any improvements, new thoughts, or refactorings needed to better "
+            "keep the orchestration healthy and the codebase maintained — without "
+            "unnecessarily adding complexity? If so, return the revised thought "
+            "list as a JSON code block."
         ),
     },
 ]
@@ -301,26 +298,359 @@ def save_wizard_yaml_data(data):
         json.dump(data, f, indent=2)
 
 
-def save_wizard_yaml(plan, team_selection, model):
-    """Append a completed orchestration to wizard.yaml."""
+def ensure_wizard_config(model):
+    """Make sure wizard.yaml holds the wizard's own config (settings + stream).
+
+    Orchestration data is never written here — it lives in the AI's own store
+    (.claude/ for Claude). Any legacy orchestrations are stripped out.
+    """
     data = load_wizard_yaml()
     data.setdefault("settings", {"default_model": model})
-    data.setdefault("orchestrations", [])
-    data.setdefault("stream", {"questions": DEFAULT_STREAM_QUESTIONS})
+    data.setdefault("stream", {"thoughts": DEFAULT_STREAM_THOUGHTS})
+    data.pop("orchestrations", None)
+    save_wizard_yaml_data(data)
 
-    team_label = team_selection.replace("Create ", "").title()
-    entry = {
+
+# ---------------------------------------------------------------------------
+# Orchestration store — Claude-native (.claude/), the source of truth
+# ---------------------------------------------------------------------------
+
+def _claude_dir():
+    return os.path.join(os.getcwd(), ".claude")
+
+
+def _agents_dir():
+    return os.path.join(_claude_dir(), "agents")
+
+
+def _manifest_path():
+    return os.path.join(_claude_dir(), "wizard-orch.json")
+
+
+def _slug(name):
+    """Turn an agent name into a Claude subagent slug (lowercase, hyphens)."""
+    return re.sub(r"[^a-z0-9]+", "-", str(name).lower()).strip("-") or "agent"
+
+
+def _team_folder(team_label):
+    """Folder grouping a team's subagents, e.g. 'Dev Team' -> 'dev_team'."""
+    base = re.sub(r"[^a-z0-9]+", "_", team_label.lower()).strip("_") or "team"
+    return base if base.endswith("_team") else base + "_team"
+
+
+def _norm_transitions(transitions):
+    """Normalize transition endpoints to agent slugs (or 'done')."""
+    out = []
+    for t in transitions:
+        to = str(t.get("to", ""))
+        out.append({
+            "from": _slug(t.get("from", "")),
+            "to": "done" if to.lower() in ("done", "end") else _slug(to),
+            "condition": t.get("condition", "always"),
+        })
+    return out
+
+
+def _flow_order(names, transitions):
+    """Best-effort linear order of agent slugs from the (normalized) transitions."""
+    if not names:
+        return []
+    fwd = {}
+    for t in transitions:
+        if t["condition"] != "fail" and t["from"] not in fwd:
+            fwd[t["from"]] = t["to"]
+    start = names[0]
+    order, seen, cur = [start], {start}, start
+    for _ in range(len(names)):
+        nxt = fwd.get(cur)
+        if not nxt or nxt == "done" or nxt in seen:
+            break
+        order.append(nxt); seen.add(nxt); cur = nxt
+    for n in names:
+        if n not in seen:
+            order.append(n); seen.add(n)
+    return order
+
+
+def _state_machine_server(server_name, team_label, start, transitions):
+    """Generate a FastMCP state-machine server that drives delegation order.
+
+    The transition table is embedded; runtime progress is persisted to a
+    state.json beside the server. The orchestrator subagent calls its tools
+    (get_current_state / report_result) so delegation follows the plan instead
+    of being guessed.
+    """
+    table = {}
+    for t in transitions:
+        table.setdefault(t["from"], {})[t["condition"]] = t["to"]
+    header = (
+        "#!/usr/bin/env python3\n"
+        f'"""Generated by White Wizard — state machine for the {team_label}.\n\n'
+        "The orchestrator subagent calls these tools to delegate in the right\n"
+        "order. Requires the `mcp` package (pip install mcp).\n"
+        '"""\n'
+        "import json, os\n"
+        "from mcp.server.fastmcp import FastMCP\n\n"
+        f"START = {start!r}\n"
+        f"TABLE = {table!r}\n"
+        f"mcp = FastMCP({server_name!r})\n"
+    )
+    body = '''
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+
+
+def _load():
+    if os.path.isfile(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"current": START, "history": []}
+
+
+def _save(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+@mcp.tool()
+def get_current_state() -> dict:
+    """Return {"current": <subagent or 'done'>, "history": [...]} — whose turn it is."""
+    return _load()
+
+
+@mcp.tool()
+def report_result(agent: str, status: str) -> str:
+    """Record a subagent's result ('pass' or 'fail') and advance to the next state."""
+    state = _load()
+    edges = TABLE.get(agent, {})
+    nxt = edges.get(status) or edges.get("always") or "done"
+    state["history"].append({"agent": agent, "status": status, "next": nxt})
+    state["current"] = nxt
+    _save(state)
+    return "Orchestration complete." if nxt == "done" else "Next state: " + nxt
+
+
+@mcp.tool()
+def reset() -> str:
+    """Reset the machine to the start state."""
+    _save({"current": START, "history": []})
+    return "Reset to " + START
+
+
+if __name__ == "__main__":
+    mcp.run()
+'''
+    return header + body
+
+
+def _orchestrator_prompt(team_label, agents, transitions, server_name):
+    """Build the lead orchestrator subagent's system prompt from the flow."""
+    by_name = {a["name"]: a for a in agents}
+    order   = _flow_order([a["name"] for a in agents], transitions)
+    lines = [
+        f"You are the orchestrator for the {team_label}: a team of Claude "
+        "subagents. You coordinate the team and pass results between members; "
+        "you do not do their work yourself.",
+        "",
+        "The team members and their jobs:",
+        "",
+    ]
+    for i, name in enumerate(order, start=1):
+        lines.append(f"{i}. **{name}** — {by_name.get(name, {}).get('description', '')}")
+    lines += [
+        "",
+        f"Use the `{server_name}` MCP state-machine tool to drive delegation in "
+        "the correct order — do not guess the sequence:",
+        "",
+        "1. Call `get_current_state` to see which subagent is up (the `current` field).",
+        "2. Delegate that step to that subagent and collect its result.",
+        "3. Call `report_result(agent, status)` with status `pass` or `fail`; it "
+        "returns the next state.",
+        "4. Repeat until the state machine reports `done`.",
+        "",
+        "Transitions (also embedded in the state machine):",
+    ]
+    for t in transitions:
+        lines.append(f"- {t['from']} → {t['to']} on {t['condition']}")
+    lines += ["", "Keep it simple — follow the state machine, add no extra steps."]
+    return "\n".join(lines)
+
+
+def _write_subagent(dir_path, name, description, tools, model, body):
+    """Write one .claude/agents subagent Markdown file (frontmatter + prompt)."""
+    front = ["---", f"name: {name}", f"description: {description}"]
+    if tools:
+        front.append("tools: " + ", ".join(tools))
+    front += [f"model: {model}", "---"]
+    with open(os.path.join(dir_path, name + ".md"), "w") as f:
+        f.write("\n".join(front) + "\n\n" + body.rstrip() + "\n")
+
+
+def write_orchestration(plan, team_selection, model):
+    """Write the orchestration to its Claude-native store under .claude/.
+
+    For Claude, the team's subagents are written as Markdown files under
+    .claude/agents/<team>_team/ — one specialist per agent plus a lead
+    orchestrator that coordinates the flow — and a manifest
+    (.claude/wizard-orch.json) records the agents, transitions, and provenance.
+    This store, not wizard.yaml, is the source of truth. Returns the team dir.
+    """
+    team_label  = team_selection.replace("Create ", "").title()
+    team_folder = _team_folder(team_label)
+    transitions = _norm_transitions(plan.get("transitions", []))
+
+    agents = [
+        {
+            "name": _slug(a["name"]),
+            "description": a.get("description", a.get("responsibility", "")),
+            "tools": a.get("tools") or [],
+            "prompt": (a.get("prompt") or "").strip(),
+        }
+        for a in plan.get("agents", [])
+    ]
+
+    team_dir = os.path.join(_agents_dir(), team_folder)
+    os.makedirs(team_dir, exist_ok=True)
+
+    for a in agents:
+        body = a["prompt"] or f"You are the {a['name']} subagent.\n\n{a['description']}\n"
+        _write_subagent(team_dir, a["name"], a["description"], a["tools"], model, body)
+
+    # State-machine MCP tool: drives delegation order for the orchestrator.
+    base    = team_folder.replace("_", "-").removesuffix("-team")
+    sm_name = base + "-state-machine"
+    order   = _flow_order([a["name"] for a in agents], transitions)
+    start   = order[0] if order else "done"
+    sm_path = os.path.join(team_dir, "state_machine.py")
+    with open(sm_path, "w") as f:
+        f.write(_state_machine_server(sm_name, team_label, start, transitions))
+    sm_rel = os.path.relpath(sm_path, os.getcwd())
+    _register_mcp_server(sm_name, ["python3", sm_rel])
+
+    orch_name = base + "-orchestrator"
+    _write_subagent(
+        team_dir, orch_name,
+        f"Coordinates the {team_label} workflow. Use to run the full {team_label} end to end.",
+        [], model,
+        _orchestrator_prompt(team_label, agents, transitions, sm_name),
+    )
+
+    manifest = {
         "created_at": datetime.date.today().isoformat(),
         "team": team_label,
+        "team_folder": team_folder,
         "model": model,
+        "orchestrator": orch_name,
         "agents": [
-            {"name": a["name"], "description": a.get("description", ""), "model": model}
-            for a in plan.get("agents", [])
+            {"name": a["name"], "description": a["description"], "model": model}
+            for a in agents
         ],
-        "transitions": plan.get("transitions", []),
+        "transitions": transitions,
+        "mcp_tools": [sm_rel],
+        "mcp_servers": [sm_name],
     }
-    data["orchestrations"].append(entry)
-    save_wizard_yaml_data(data)
+    with open(_manifest_path(), "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    ensure_wizard_config(model)
+    return team_dir
+
+
+def load_orchestration():
+    """Load the current orchestration from .claude/, or None.
+
+    .claude/wizard-orch.json is the source of truth. Returns a dict shaped like
+    the old wizard.yaml orchestration entry, so callers stay unchanged.
+    """
+    path = _manifest_path()
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            orch = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(orch, dict) or not orch.get("agents"):
+        return None
+    return orch
+
+
+# ---------------------------------------------------------------------------
+# Wipe the orchestration system
+# ---------------------------------------------------------------------------
+
+def _remove_path(path):
+    """Delete a file or directory tree. Returns True if something was removed."""
+    import shutil
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+        return True
+    if os.path.exists(path) or os.path.islink(path):
+        os.remove(path)
+        return True
+    return False
+
+
+def wipe_orchestration():
+    """Delete the orchestration the wizard produced. DESTRUCTIVE, no undo.
+
+    For Claude the orchestration is the team's subagent folder(s) under
+    .claude/agents/<team>_team/ plus the manifest (.claude/wizard-orch.json) and
+    any MCP tools the wizard generated. The wizard's own config (wizard.yaml
+    settings + stream thoughts) is preserved.
+    """
+    import glob
+    cwd  = os.getcwd()
+    orch = load_orchestration() or {}
+
+    targets = list(glob.glob(os.path.join(_agents_dir(), "*_team")))
+    targets.append(_manifest_path())
+    for rel in orch.get("mcp_tools", []):
+        targets.append(os.path.join(cwd, rel))
+
+    removed = [os.path.relpath(p, cwd) for p in dict.fromkeys(targets) if _remove_path(p)]
+
+    # Unregister the wizard's MCP servers without clobbering any the user added.
+    if _unregister_mcp_servers(orch.get("mcp_servers", [])):
+        removed.append(".mcp.json (entries removed)")
+
+    # Strip any legacy orchestrations from wizard.yaml (now lives in .claude/).
+    data = load_wizard_yaml()
+    if data.get("orchestrations"):
+        data.pop("orchestrations", None)
+        save_wizard_yaml_data(data)
+        removed.append("wizard.yaml orchestrations")
+
+    return removed
+
+
+def _confirm_and_wipe():
+    """Confirm with a danger warning, then wipe. Returns True if anything was wiped."""
+    confirmed = yes_no(
+        "Wipe the orchestration system?\n\n"
+        "  DANGER: this permanently deletes the orchestration the wizard\n"
+        "  produced — the generated agent files and .claude/agents definitions.\n"
+        "  This cannot be undone. Your wizard.yaml settings are kept.\n\n"
+        "  Are you sure?"
+    )
+    if not confirmed:
+        return False
+
+    removed = wipe_orchestration()
+    clear()
+    show_header()
+    if removed:
+        print(color("  Orchestration system wiped.\n", BOLD, GOLD))
+        for item in removed:
+            print(color(f"    - {item}", DIM, WHITE))
+    else:
+        print(color("  Nothing to wipe — no orchestration system found.\n", DIM, WHITE))
+    print()
+    print(color("  Press any key to continue...", DIM, WHITE))
+    read_key()
+    return bool(removed)
 
 
 # ---------------------------------------------------------------------------
@@ -346,15 +676,15 @@ def _ask_and_show(query):
     _show_wizard_response(response)
 
 
-def _prompt_orchestration(data, user_prompt=None, task_mode=False):
+def _prompt_orchestration(user_prompt=None, task_mode=False):
     """Call Claude with the orchestration context and display the response."""
-    orch_json = json.dumps(data.get("orchestrations", []), indent=2)
-    last      = (data.get("orchestrations") or [{}])[-1]
-    team      = last.get("team", "dev")
+    orch      = load_orchestration() or {}
+    orch_json = json.dumps(orch, indent=2)
+    team      = orch.get("team", "dev team")
 
     if task_mode and user_prompt:
         prompt = (
-            f"You are the orchestrator for a multi-agent {team} team.\n\n"
+            f"You are the orchestrator for a multi-agent {team}.\n\n"
             f"The user wants the team to: {user_prompt}\n\n"
             f"Based on the plan below, outline which agents should handle this task, "
             f"in what order, and what each agent should specifically do.\n\n"
@@ -374,24 +704,20 @@ def _prompt_orchestration(data, user_prompt=None, task_mode=False):
 
 
 def handle_wizard_yaml(path):
-    data           = load_wizard_yaml()
-    orchestrations = data.get("orchestrations", [])
-    last           = orchestrations[-1] if orchestrations else None
-    team           = last.get("team", "Dev") if last else "Dev"
+    last = load_orchestration()
+    team = last.get("team", "team") if last else "team"
 
-    TASK_OPT   = f"What do you want the {team} team to do?"
-    MANAGE_OPT = "Manage the system"
-    OTHER_OPT  = "Something else"
-    STREAM_OPT = "Start streaming"
-    WY_OPTIONS = [TASK_OPT, MANAGE_OPT, OTHER_OPT, STREAM_OPT]
-    TEXT_OPTS  = {TASK_OPT, OTHER_OPT}
+    task_label = f"What do you want the {team} to do?"
+    options = [
+        Option("task",   task_label, text_input=True, placeholder=task_label),
+        Option("manage", "Manage the system"),
+        Option("other",  "Something else", text_input=True,
+               placeholder="Something else"),
+        Option("stream", "Start streaming"),
+        Option("wipe",   "Wipe the orchestration system"),
+    ]
 
-    selected    = 0
-    custom_text = ""
-
-    while True:
-        clear()
-        show_header()
+    def render_top():
         if last:
             agents  = last.get("agents", [])
             created = last.get("created_at", "")
@@ -399,59 +725,28 @@ def handle_wizard_yaml(path):
             for a in agents:
                 print(color(f"    · {a['name']}", DIM, WHITE))
         else:
-            print(color("  No orchestrations in wizard.yaml yet.", DIM, WHITE))
-        print()
-        print(color("  (arrows · Enter to choose · q to quit)", DIM, WHITE))
+            print(color("  No orchestration in .claude/ yet.", DIM, WHITE))
         print()
 
-        on_custom = WY_OPTIONS[selected] in TEXT_OPTS
-
-        for i, opt in enumerate(WY_OPTIONS):
-            chosen = i == selected
-            if opt in TEXT_OPTS:
-                if chosen:
-                    body   = color(custom_text, WHITE) if custom_text else ""
-                    cursor = color("_", GRAY, BLINK)
-                    print(color(f"   > {opt}: ", BOLD, GOLD) + body + cursor)
-                else:
-                    print("     " + color(opt, WHITE))
-            elif chosen:
-                print(color(f"   > {opt}  ", BOLD, GOLD, REV))
-            else:
-                print(color(f"     {opt}", WHITE))
-        print()
-
-        key = read_key()
-
-        if key == "up":
-            prev = selected
-            selected = (selected - 1) % len(WY_OPTIONS)
-            if selected != prev:
-                custom_text = ""
-        elif key == "down":
-            prev = selected
-            selected = (selected + 1) % len(WY_OPTIONS)
-            if selected != prev:
-                custom_text = ""
-        elif key == "enter":
-            choice = WY_OPTIONS[selected]
-            if choice == STREAM_OPT:
-                run_stream_mode()
-            elif choice == MANAGE_OPT:
-                _prompt_orchestration(data)
-            elif choice in TEXT_OPTS and custom_text.strip():
-                _prompt_orchestration(data, custom_text.strip(),
-                                      task_mode=(choice == TASK_OPT))
-                custom_text = ""
-        elif key in ("q", "Q") and not on_custom:
+    while True:
+        choice, text = menu(
+            options,
+            hint="(arrows · Enter to choose · q to quit)",
+            render_top=render_top,
+        )
+        if choice is None:
             return None
-        elif key == "esc":
-            return None
-        elif on_custom:
-            if key == "backspace":
-                custom_text = custom_text[:-1]
-            elif len(key) == 1 and key.isprintable():
-                custom_text += key
+        if choice == "stream":
+            run_stream_mode()
+        elif choice == "wipe":
+            if _confirm_and_wipe():
+                return None
+        elif choice == "manage":
+            _prompt_orchestration()
+        elif choice == "task" and text:
+            _prompt_orchestration(text, task_mode=True)
+        elif choice == "other" and text:
+            _prompt_orchestration(text)
 
 
 # ---------------------------------------------------------------------------
@@ -523,177 +818,33 @@ OPTIONS = [
 ]
 
 
-def read_key():
-    import termios
-    import tty
-
-    fd  = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\033":
-            if sys.stdin.read(1) == "[":
-                code = sys.stdin.read(1)
-                return {"A": "up", "B": "down"}.get(code, "ignore")
-            return "esc"
-        if ch in ("\r", "\n"):
-            return "enter"
-        if ch in ("\x7f", "\x08"):
-            return "backspace"
-        if ch == "\x03":
-            raise KeyboardInterrupt
-        return ch
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-def render_menu(options, selected, title, hint, custom_text):
-    clear()
-    show_header()
-    print(color("  " + title, BOLD, CYAN))
-    print(color("  " + hint, DIM, WHITE))
-    print()
-    for i, option in enumerate(options):
-        chosen   = i == selected
-        disabled = option in DISABLED_TYPES
-        if option == CUSTOM_OPTION:
-            if chosen and not disabled:
-                body   = color(custom_text, WHITE) if custom_text else color(option, GRAY)
-                cursor = color("_", GRAY, BLINK)
-                print(color("   > ", BOLD, GOLD) + body + cursor)
-            else:
-                print("     " + color(option + "  (coming soon)", GRAY))
-        elif disabled:
-            print("     " + color(option + "  (coming soon)", GRAY))
-        elif chosen:
-            print(color(f"   > {option}  ", BOLD, GOLD, REV))
-        else:
-            print(color(f"     {option}", WHITE))
-    print()
-    print(color("  " + "─" * 40, DIM, WHITE))
-    print(color("  s  ·  Stream mode", DIM, WHITE))
-    print()
-
-
 def select(options, title,
            hint="(arrows to move - type to fill in 'Something else' - Enter to choose - q to quit)"):
-    if not sys.stdin.isatty():
-        clear()
-        show_header()
-        print(color("  " + title, BOLD, CYAN))
-        for i, option in enumerate(options, start=1):
-            print(f"   {i}. {option}")
-        raw = sys.stdin.readline().strip()
-        if not (raw.isdigit() and 1 <= int(raw) <= len(options)):
-            return None
-        option = options[int(raw) - 1]
-        if option == CUSTOM_OPTION:
-            typed = sys.stdin.readline().strip()
-            return typed or "a custom orchestration system"
-        return option
+    """Pick one of ``options`` (a list of label strings).
 
-    active   = [i for i, o in enumerate(options) if o not in DISABLED_TYPES]
-    selected = active[0] if active else 0
-    custom_text = ""
-    while True:
-        render_menu(options, selected, title, hint, custom_text)
-        key      = read_key()
-        on_custom = options[selected] == CUSTOM_OPTION
-        if key == "up" and active:
-            idx      = active.index(selected) if selected in active else 0
-            selected = active[(idx - 1) % len(active)]
-        elif key == "down" and active:
-            idx      = active.index(selected) if selected in active else 0
-            selected = active[(idx + 1) % len(active)]
-        elif key == "enter":
-            if on_custom:
-                return custom_text.strip() or "a custom orchestration system"
-            return options[selected]
-        elif key == "esc":
-            return None
-        elif key in ("s", "S") and not on_custom:
-            return "__stream__"
-        elif on_custom:
-            if key == "backspace":
-                custom_text = custom_text[:-1]
-            elif len(key) == 1 and key.isprintable():
-                custom_text += key
-        elif key in ("q", "Q"):
-            return None
+    Returns the chosen label, the typed text for the custom option,
+    "__stream__" for the stream shortcut, or None if cancelled.
+    """
+    opts = [
+        Option(o, o,
+               text_input=(o == CUSTOM_OPTION),
+               disabled=(o in DISABLED_TYPES),
+               placeholder=(o if o == CUSTOM_OPTION else ""))
+        for o in options
+    ]
 
+    def footer():
+        print(color("  " + "─" * 40, DIM, WHITE))
+        print(color("  s  ·  Stream mode", DIM, WHITE))
+        print()
 
-# ---------------------------------------------------------------------------
-# Approval menu
-# ---------------------------------------------------------------------------
-
-APPROVAL_YES    = "Yes, proceed"
-APPROVAL_NO     = "No, start over"
-APPROVAL_DETAIL = "No, "
-
-
-def render_approval(selected, feedback_text, content=""):
-    clear()
-    show_header()
-    if content:
-        print(content)
-    print(color("  Does this look right?", BOLD, CYAN))
-    print(color("  (arrows to move · type feedback on last option · Enter to choose)", DIM, WHITE))
-    print()
-    options = [APPROVAL_YES, APPROVAL_NO, APPROVAL_DETAIL]
-    for i, opt in enumerate(options):
-        chosen = i == selected
-        if opt == APPROVAL_DETAIL:
-            prefix = color("No, ", GRAY)
-            typed  = color(feedback_text, WHITE) if feedback_text else ""
-            cursor = color("_", GRAY, BLINK) if chosen else ""
-            if chosen:
-                print(color("   > ", BOLD, GOLD) + prefix + typed + cursor)
-            else:
-                print("     " + prefix + typed)
-        elif chosen:
-            print(color(f"   > {opt}  ", BOLD, GOLD, REV))
-        else:
-            print(color(f"     {opt}", WHITE))
-    print()
-
-
-def approval_select(content=""):
-    if not sys.stdin.isatty():
-        raw = sys.stdin.readline().strip()
-        if raw == "1":
-            return ("yes", "")
-        if raw == "2":
-            return ("no", "")
-        detail = sys.stdin.readline().strip()
-        return ("detail", detail or "no feedback given")
-
-    selected      = 0
-    feedback_text = ""
-    while True:
-        render_approval(selected, feedback_text, content=content)
-        key       = read_key()
-        on_detail = selected == 2
-        if key == "up":
-            selected = (selected - 1) % 3
-        elif key == "down":
-            selected = (selected + 1) % 3
-        elif key == "enter":
-            if selected == 0:
-                return ("yes", "")
-            elif selected == 1:
-                return ("no", "")
-            else:
-                return ("detail", feedback_text.strip() or "no feedback given")
-        elif key == "esc":
-            return ("no", "")
-        elif on_detail:
-            if key == "backspace":
-                feedback_text = feedback_text[:-1]
-            elif len(key) == 1 and key.isprintable():
-                feedback_text += key
-        elif key in ("q", "Q"):
-            return ("no", "")
+    value, text = menu(opts, title, hint=hint, footer=footer,
+                       extra_keys={"s": "__stream__", "S": "__stream__"})
+    if value is None or value == "__stream__":
+        return value
+    if value == CUSTOM_OPTION:
+        return text or "a custom orchestration system"
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -702,29 +853,12 @@ def approval_select(content=""):
 
 def yes_no(question):
     """Display a two-option yes/no menu. Returns True for yes, False for no."""
-    options  = ["Yes", "No"]
-    selected = 0
-    while True:
-        clear()
-        show_header()
-        print(color(f"  {question}", BOLD, CYAN))
-        print(color("  (arrows · Enter to choose)", DIM, WHITE))
-        print()
-        for i, opt in enumerate(options):
-            if i == selected:
-                print(color(f"   > {opt}  ", BOLD, GOLD, REV))
-            else:
-                print(color(f"     {opt}", WHITE))
-        print()
-        key = read_key()
-        if key == "up":
-            selected = (selected - 1) % 2
-        elif key == "down":
-            selected = (selected + 1) % 2
-        elif key == "enter":
-            return selected == 0
-        elif key in ("esc", "q", "Q"):
-            return False
+    value, _ = menu(
+        [Option(True, "Yes"), Option(False, "No")],
+        title=question,
+        hint="(arrows · Enter to choose)",
+    )
+    return value is True
 
 
 # ---------------------------------------------------------------------------
@@ -805,95 +939,111 @@ def parse_generated_files(response):
     return [(p.strip(), c.strip()) for p, c in re.findall(pattern, response, re.DOTALL)]
 
 
-def offer_mcp_server(synopsis):
-    """Offer to generate a project-specific MCP server for detected commands."""
-    want = yes_no(
-        "Would you like to generate a project MCP server?\n"
-        "  Wizard can expose your project's commands (test, build, deploy)\n"
-        "  as MCP tools that agents call directly."
-    )
-    if not want:
-        return
+def _smoke_test(team_dir, orch):
+    """Validate the freshly built orchestration. Returns (ok, [(label, passed, detail)])."""
+    import ast
+    checks = []
+    agents = [a["name"] for a in orch.get("agents", [])]
 
-    prompt = (
-        "You are White Wizard generating a project-specific MCP server.\n\n"
-        "Based on the project context below, identify the most important runnable "
-        "commands (from README, Makefile, package.json, etc.) and generate a "
-        "FastMCP server that exposes them as tools.\n\n"
-        "Use the ### FILE: format:\n\n"
-        "### FILE: mcp_project_tools.py\n```python\n<code>\n```\n\n"
-        "Project context:\n" + synopsis
-    )
-    response = conjure(ask, prompt, label="Generating MCP server...", model=DEFAULT_MODEL)
+    # 1. Every subagent (specialists + orchestrator) has a file with frontmatter.
+    missing = []
+    for name in agents + [orch.get("orchestrator", "")]:
+        if not name:
+            continue
+        p = os.path.join(team_dir, name + ".md")
+        if not os.path.isfile(p):
+            missing.append(name)
+            continue
+        with open(p) as f:
+            head = f.read()
+        if not (head.lstrip().startswith("---") and "name:" in head and "description:" in head):
+            missing.append(name + " (frontmatter)")
+    checks.append(("Subagent files and frontmatter", not missing, ", ".join(missing)))
 
-    files = parse_generated_files(response)
-    if not files:
-        print(color("\n  Could not generate MCP server from response.\n", DIM, WHITE))
-        return
+    # 2. The state-machine MCP tool is syntactically valid.
+    sm = os.path.join(team_dir, "state_machine.py")
+    sm_ok = os.path.isfile(sm)
+    sm_detail = "" if sm_ok else "state_machine.py missing"
+    if sm_ok:
+        try:
+            with open(sm) as f:
+                ast.parse(f.read())
+        except SyntaxError as exc:
+            sm_ok, sm_detail = False, str(exc)
+    checks.append(("State-machine tool valid", sm_ok, sm_detail))
 
-    cwd = os.getcwd()
-    for rel_path, code in files:
-        full_path = os.path.join(cwd, rel_path)
-        dir_path  = os.path.dirname(full_path)
-        if dir_path:
-            os.makedirs(dir_path, exist_ok=True)
-        with open(full_path, "w") as f:
-            f.write(code + "\n")
-        print(color(f"    {rel_path}", WHITE))
+    # 3. Transitions reference real agents (or 'done').
+    known = set(agents) | {"done"}
+    trans = orch.get("transitions", [])
+    bad = [f"{t.get('from')}→{t.get('to')}"
+           for t in trans
+           if t.get("to") not in known or t.get("from") not in set(agents)]
+    checks.append(("Transitions reference real agents", not bad, ", ".join(bad)))
+
+    # 4. Following pass/always edges from the start reaches 'done'.
+    fwd = {}
+    for t in trans:
+        if t.get("condition") in ("pass", "always") and t.get("from") not in fwd:
+            fwd[t["from"]] = t.get("to")
+    cur, seen, reached = (agents[0] if agents else "done"), set(), False
+    for _ in range(len(agents) + 2):
+        if cur == "done":
+            reached = True
+            break
+        if cur in seen:
+            break
+        seen.add(cur)
+        cur = fwd.get(cur)
+        if cur is None:
+            break
+    checks.append(("Flow reaches 'done'", reached, "" if reached else f"stuck at {cur}"))
+
+    # 5. The state-machine server is registered in .mcp.json.
+    reg = False
+    mp = os.path.join(os.getcwd(), ".mcp.json")
+    if os.path.isfile(mp):
+        try:
+            with open(mp) as f:
+                servers = json.load(f).get("mcpServers", {})
+            reg = all(s in servers for s in orch.get("mcp_servers", []))
+        except Exception:
+            reg = False
+    checks.append(("MCP server registered", reg, ""))
+
+    return all(passed for _, passed, _ in checks), checks
 
 
-def generate_and_write_agents(plan, team_selection, synopsis):
-    """Call Claude to generate agent code from the approved plan, write files to disk."""
-    template = load_prompt("generate_agents.md")
-    prompt   = (template.replace("{plan_json}", json.dumps(plan, indent=2))
-                + "\n" + synopsis)
-
-    response = conjure(ask, prompt, label="Generating agent code...", model=DEFAULT_MODEL)
-
-    files = parse_generated_files(response)
-    if not files:
-        clear()
-        show_header()
-        print(color("  Could not parse generated files from Claude's response.\n", DIM, WHITE))
-        for line in response.splitlines():
-            print(color("  " + line, WHITE))
-        return []
-
-    cwd     = os.getcwd()
-    written = []
-    for rel_path, code in files:
-        full_path = os.path.join(cwd, rel_path)
-        dir_path  = os.path.dirname(full_path)
-        if dir_path:
-            os.makedirs(dir_path, exist_ok=True)
-        with open(full_path, "w") as f:
-            f.write(code + "\n")
-        written.append(rel_path)
-
+def show_orchestration_created(team_selection, team_dir, smoke_ok=None, smoke_checks=None):
+    """Show the Claude-native subagent files that were written, smoke-test results, and how to run."""
     clear()
     show_header()
     team_label = team_selection.replace("Create ", "").title()
-    print(color(f"  {team_label} — orchestration system generated\n", BOLD, CYAN))
-    for rel_path in written:
-        print(color(f"    {rel_path}", WHITE))
+    orch = load_orchestration() or {}
+    rel  = os.path.relpath(team_dir, os.getcwd())
+
+    print(color(f"  {team_label} — subagents created\n", BOLD, CYAN))
+    print(color(f"  {rel}/", DIM, WHITE))
+    for name in sorted(os.listdir(team_dir)):
+        print(color(f"    {name}", WHITE))
     print()
+    if smoke_checks is not None:
+        print(color(f"  Smoke test {'passed' if smoke_ok else 'found issues'}:",
+                    BOLD, GOLD if smoke_ok else GRAY))
+        for label, passed, detail in smoke_checks:
+            line = f"    {'✓' if passed else '✗'} {label}"
+            if detail and not passed:
+                line += f" — {detail}"
+            print(color(line, WHITE if passed else GRAY))
+        print()
     print(color("  To run your orchestration:", DIM, WHITE))
-    print(color("    python3 run_orch.py\n", BOLD, GOLD))
-
-    # Offer project MCP server
-    offer_mcp_server(synopsis)
-
-    return written
-
-
-def display_synopsis(synopsis):
-    clear()
-    show_header()
-    print(color("  Project synopsis", BOLD, CYAN))
-    print(color("  " + "-" * 50, DIM, WHITE))
-    for line in synopsis.splitlines():
-        print(color("  " + line, WHITE))
-    print()
+    print(color("    pip install mcp   # the state-machine tool needs it", DIM, WHITE))
+    print(color("    open Claude in this project and invoke the orchestrator —", DIM, WHITE))
+    print(color(f"    e.g. ask Claude to use the '{orch.get('orchestrator', 'orchestrator')}' subagent.\n",
+                BOLD, GOLD))
+    print(color("  The orchestrator delegates via the generated state-machine MCP tool,", DIM, WHITE))
+    print(color("  so each subagent runs in the right order.\n", DIM, WHITE))
+    print(color("  Press any key to continue...", DIM, WHITE))
+    read_key()
 
 
 def run_team_conversation(team_selection, synopsis, custom_description=""):
@@ -901,51 +1051,58 @@ def run_team_conversation(team_selection, synopsis, custom_description=""):
     template        = load_prompt(prompt_file)
     if "{team_description}" in template:
         template = template.replace("{team_description}", custom_description)
-    initial_prompt  = template + "\n" + synopsis
+    guidelines      = load_prompt("subagent_guidelines.md")
+    initial_prompt  = (template + "\n" + guidelines
+                       + "\n\n## Project context\n" + synopsis)
 
-    history = []
-    current = initial_prompt
-
-    while True:
+    # Generate the plan — auto-retry until it parses; the wizard builds it for
+    # the user rather than asking for approval.
+    history, current, plan, response = [], initial_prompt, None, ""
+    for _ in range(4):
         response = conjure(ask_with_history, history, current,
-                           label="Conjuring magic...", model=DEFAULT_MODEL)
+                           label="Conjuring the orchestration...", model=DEFAULT_MODEL)
         history.append(("user", current))
         history.append(("assistant", response))
-
         plan = parse_agent_plan(response)
-
         if plan:
-            content = render_infographic(plan, team_name=team_selection)
-        else:
-            lines = [color("  " + "─" * 50, DIM, WHITE)]
-            for line in response.splitlines():
-                lines.append(color("  " + line, WHITE))
-            lines.append(color("  " + "─" * 50, DIM, WHITE))
-            lines.append("")
-            content = "\n".join(lines)
+            break
+        current = ("Please return the agent plan now as a single JSON code block "
+                   "in the required format, with no other text.")
 
-        action, detail = approval_select(content=content)
+    if not plan:
+        clear()
+        show_header()
+        print(color("  The wizard could not produce an orchestration plan.\n", BOLD, GOLD))
+        for line in response.splitlines():
+            print(color("  " + line, WHITE))
+        print()
+        print(color("  Press any key to continue...", DIM, WHITE))
+        read_key()
+        return None
 
-        if action == "yes":
-            if plan:
-                save_wizard_yaml(plan, team_selection, DEFAULT_MODEL)
-                generate_and_write_agents(plan, team_selection, synopsis)
-                return "done"
-            else:
-                current = ("Please proceed and return the agent plan now "
-                           "in the required JSON format.")
-        elif action == "no":
-            return None
-        else:
-            current = f"Please revise the plan with this feedback: {detail}"
+    # Show the orchestration, then build it for them.
+    clear()
+    show_header()
+    print(render_infographic(plan, team_name=team_selection))
+    print()
+    loading("Building the AI orchestration system...", seconds=2.0)
+    team_dir = write_orchestration(plan, team_selection, DEFAULT_MODEL)
+
+    # Smoke-test the freshly built orchestration.
+    clear()
+    show_header()
+    print(color(f"  {team_selection.replace('Create ', '').title()} — orchestration built\n",
+                BOLD, CYAN))
+    loading("Running a smoke test on the orchestration...", seconds=1.6)
+    ok, checks = _smoke_test(team_dir, load_orchestration() or {})
+
+    show_orchestration_created(team_selection, team_dir, ok, checks)
+    return "done"
 
 
 def plan_with_ai(files):
     prompt  = load_prompt("analyze_codebase.md") + "\n".join(files[:60])
     synopsis = conjure(ask, prompt, label="Analysing codebase...", model=DEFAULT_MODEL)
-
-    display_synopsis(synopsis)
-    time.sleep(0.6)
 
     while True:
         team = select(ORCH_TYPES, "Which team do you want to set up?")
@@ -981,14 +1138,11 @@ def _current_commit():
         return None
 
 
-def _stream_approval(question, response):
+def _stream_approval(thought, response):
     """Three-option menu: Approve / Skip / Quit. Returns 'approve'|'skip'|'quit'."""
-    options  = ["Approve finding", "Skip", "Quit stream"]
-    selected = 0
-
     content_lines = [
         "",
-        color(f"  Stream · {question['id']}  (priority {question['priority']})", BOLD, CYAN),
+        color(f"  Stream · {thought['id']}  (priority {thought['priority']})", BOLD, CYAN),
         color("  " + "─" * 50, DIM, WHITE),
         "",
     ]
@@ -997,32 +1151,19 @@ def _stream_approval(question, response):
     content_lines.append("")
     content = "\n".join(content_lines)
 
-    while True:
-        clear()
-        show_header()
-        print(content)
-        print(color("  What would you like to do with this finding?", BOLD, CYAN))
-        print(color("  (arrows · Enter to choose)", DIM, WHITE))
-        print()
-        for i, opt in enumerate(options):
-            if i == selected:
-                print(color(f"   > {opt}  ", BOLD, GOLD, REV))
-            else:
-                print(color(f"     {opt}", WHITE))
-        print()
-        key = read_key()
-        if key == "up":
-            selected = (selected - 1) % 3
-        elif key == "down":
-            selected = (selected + 1) % 3
-        elif key == "enter":
-            return ["approve", "skip", "quit"][selected]
-        elif key in ("esc", "q", "Q"):
-            return "quit"
+    value, _ = menu(
+        [Option("approve", "Approve finding"),
+         Option("skip",    "Skip"),
+         Option("quit",    "Quit stream")],
+        title="What would you like to do with this finding?",
+        hint="(arrows · Enter to choose)",
+        render_top=lambda: print(content),
+    )
+    return value or "quit"
 
 
-def _valid_question(q):
-    """A stream question must have a non-empty id/prompt and an int priority."""
+def _valid_thought(q):
+    """A stream thought must have a non-empty id/prompt and an int priority."""
     return (
         isinstance(q, dict)
         and isinstance(q.get("id"), str) and q["id"].strip()
@@ -1031,35 +1172,147 @@ def _valid_question(q):
     )
 
 
-def _try_update_stream_questions(response, data):
-    """If Claude returned a valid revised question list, write it back to wizard.yaml.
+def _try_update_stream_thoughts(response, data):
+    """If Claude returned a valid revised thought list, write it back to wizard.yaml.
 
     The whole list is rejected if any item is malformed, so a bad AI response
-    can never leave the persisted questions in a half-broken state.
+    can never leave the persisted thoughts in a half-broken state.
     """
     m = re.search(r'```json\s*(\[.*?\])\s*```', response, re.DOTALL)
     if not m:
         return
     try:
-        new_questions = json.loads(m.group(1))
+        new_thoughts = json.loads(m.group(1))
     except Exception:
         return
-    if not (isinstance(new_questions, list) and new_questions):
+    if not (isinstance(new_thoughts, list) and new_thoughts):
         return
-    if not all(_valid_question(q) for q in new_questions):
+    if not all(_valid_thought(q) for q in new_thoughts):
         return
     cleaned = [
         {"priority": q["priority"], "id": q["id"], "prompt": q["prompt"]}
-        for q in new_questions
+        for q in new_thoughts
     ]
-    data.setdefault("stream", {})["questions"] = cleaned
+    data.setdefault("stream", {}).pop("questions", None)
+    data.setdefault("stream", {})["thoughts"] = cleaned
     save_wizard_yaml_data(data)
-    print(color("\n  Stream questions updated in wizard.yaml.\n", BOLD, GOLD))
+    print(color("\n  Stream thoughts updated in wizard.yaml.\n", BOLD, GOLD))
 
 
-def _build_question_prompt(template, q, git_diff, orch_plan, last_commit, current_commit):
+def _register_mcp_server(server_name, command):
+    """Add an MCP server to the project's .mcp.json (merge, don't clobber)."""
+    path   = os.path.join(os.getcwd(), ".mcp.json")
+    config = {}
+    if os.path.isfile(path):
+        try:
+            with open(path) as f:
+                config = json.load(f)
+        except Exception:
+            config = {}
+    config.setdefault("mcpServers", {})[server_name] = {
+        "command": command[0], "args": command[1:],
+    }
+    with open(path, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def _unregister_mcp_servers(names):
+    """Remove named servers from .mcp.json; delete the file if it ends up empty.
+
+    Returns True if .mcp.json changed.
+    """
+    path = os.path.join(os.getcwd(), ".mcp.json")
+    if not names or not os.path.isfile(path):
+        return False
+    try:
+        with open(path) as f:
+            config = json.load(f)
+    except Exception:
+        return False
+    servers = config.get("mcpServers", {})
+    changed = False
+    for n in names:
+        if n in servers:
+            del servers[n]
+            changed = True
+    if not changed:
+        return False
+    if servers:
+        with open(path, "w") as f:
+            json.dump(config, f, indent=2)
+    else:
+        _remove_path(path)
+    return True
+
+
+def _append_to_subagent(team_folder, agent_slug, note):
+    """Append an MCP-tool usage note to a subagent file. Returns True if updated."""
+    path = os.path.join(_agents_dir(), team_folder, agent_slug + ".md")
+    if not os.path.isfile(path):
+        return False
+    with open(path, "a") as f:
+        f.write(f"\n## MCP tools\n- {note}\n")
+    return True
+
+
+def _try_build_mcp_tool(answer, orch):
+    """Build an MCP tool the stream proposed and wire the subagents to it.
+
+    Expects generated ### FILE: blocks (the MCP server) plus a JSON object with
+    server_name, command (argv list), agents (subagent names to update), and an
+    optional tool_note. Writes the file(s), registers the server in .mcp.json,
+    appends the note to each named subagent, and records the artifacts in the
+    manifest so wipe cleans them up. No-ops on an incomplete proposal.
+    """
+    files = parse_generated_files(answer)
+    m     = re.search(r'```json\s*(\{.*?\})\s*```', answer, re.DOTALL)
+    if not files or not m:
+        return
+    try:
+        spec = json.loads(m.group(1))
+    except Exception:
+        return
+    server_name = spec.get("server_name")
+    command     = spec.get("command")
+    if not (server_name and isinstance(command, list) and command):
+        return
+
+    cwd, written = os.getcwd(), []
+    for rel_path, code in files:
+        full = os.path.join(cwd, rel_path)
+        if os.path.dirname(full):
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(code + "\n")
+        written.append(rel_path)
+
+    _register_mcp_server(server_name, command)
+
+    note        = spec.get("tool_note") or f"Use the {server_name} MCP tool."
+    team_folder = orch.get("team_folder", "")
+    updated = [a for a in spec.get("agents", [])
+               if _append_to_subagent(team_folder, _slug(a), note)]
+
+    # Record generated artifacts in the manifest so wipe removes them.
+    path = _manifest_path()
+    if os.path.isfile(path):
+        try:
+            with open(path) as f:
+                manifest = json.load(f)
+            manifest.setdefault("mcp_tools", []).extend(written)
+            manifest.setdefault("mcp_servers", []).append(server_name)
+            with open(path, "w") as f:
+                json.dump(manifest, f, indent=2)
+        except Exception:
+            pass
+
+    print(color(f"\n  Built MCP tool '{server_name}' ({len(written)} file(s)); "
+                f"updated {len(updated)} subagent(s).\n", BOLD, GOLD))
+
+
+def _build_thought_prompt(template, q, git_diff, orch_plan, last_commit, current_commit):
     return (template
-            .replace("{question_prompt}", q.get("prompt", ""))
+            .replace("{thought_prompt}", q.get("prompt", ""))
             .replace("{git_diff}", git_diff[:4000])
             .replace("{orch_plan}", orch_plan[:2000])
             .replace("{last_commit}", last_commit or "none")
@@ -1069,7 +1322,7 @@ def _build_question_prompt(template, q, git_diff, orch_plan, last_commit, curren
 def _wizard_route(answer, current_q, remaining):
     """ROUTE state: the White Wizard reads an agent's answer and decides
     (a) whether it is an actionable finding worth surfacing to the user, and
-    (b) which remaining question to visit next ('done' to finish).
+    (b) which remaining thought to visit next ('done' to finish).
 
     Returns (actionable: bool, next_id: str). Defaults to surfacing the finding
     when the wizard's reply can't be parsed, so nothing is silently hidden.
@@ -1078,16 +1331,16 @@ def _wizard_route(answer, current_q, remaining):
     menu = "\n".join(f'  - {q["id"]}: {q.get("prompt", "")}' for q in remaining) or "  (none)"
     prompt = (
         "You are the White Wizard, the router in a two-state stream-mode state "
-        "machine. An agent has just answered a review question. Do two things:\n"
+        "machine. An agent has just answered a review thought. Do two things:\n"
         "1. Decide whether the answer is an ACTIONABLE finding (a real issue, a "
         "needed change, or a concrete recommendation) or a NO-OP (no issues, "
         "nothing to do).\n"
-        "2. Choose which remaining question to visit next, or finish.\n\n"
-        f"Question answered ({current_q.get('id')}): {current_q.get('prompt', '')}\n\n"
+        "2. Choose which remaining thought to visit next, or finish.\n\n"
+        f"Thought answered ({current_q.get('id')}): {current_q.get('prompt', '')}\n\n"
         f"Agent's answer:\n{answer}\n\n"
-        f"Remaining questions:\n{menu}\n\n"
+        f"Remaining thoughts:\n{menu}\n\n"
         "Reply with ONLY a JSON object, no prose:\n"
-        '{"actionable": true or false, "next": "<question id, or done>"}'
+        '{"actionable": true or false, "next": "<thought id, or done>"}'
     )
     decision = conjure(ask, prompt, label="Wizard routing...", model=DEFAULT_MODEL)
 
@@ -1103,9 +1356,28 @@ def _wizard_route(answer, current_q, remaining):
     return actionable, nxt
 
 
+def _load_stream_thoughts(data):
+    """Read stream thoughts from wizard.yaml, accepting the legacy 'questions' key.
+
+    wizard.yaml is hand-editable, so tolerate a malformed ``stream`` section
+    (non-dict, or a non-list thoughts value) by falling back to the defaults
+    instead of crashing.
+    """
+    stream = data.get("stream") if isinstance(data, dict) else None
+    if not isinstance(stream, dict):
+        stream = {}
+    raw = stream.get("thoughts")
+    if raw is None:
+        raw = stream.get("questions", DEFAULT_STREAM_THOUGHTS)
+    if not isinstance(raw, list):
+        raw = DEFAULT_STREAM_THOUGHTS
+    thoughts = [q for q in raw if _valid_thought(q)]
+    return thoughts or list(DEFAULT_STREAM_THOUGHTS)
+
+
 def run_stream_mode():
     """Run stream mode as a two-state machine: an agent ANSWERs the current
-    question, then the White Wizard ROUTEs to the next question (or finishes)."""
+    thought, then the White Wizard ROUTEs to the next thought (or finishes)."""
     clear()
     show_header()
 
@@ -1115,14 +1387,11 @@ def run_stream_mode():
         print(color("  Run `wizard` first to set up an orchestration.\n", DIM, WHITE))
         return
 
-    data      = load_wizard_yaml()
-    questions = [q for q in data.get("stream", {}).get("questions", DEFAULT_STREAM_QUESTIONS)
-                 if _valid_question(q)]
-    if not questions:
-        questions = list(DEFAULT_STREAM_QUESTIONS)
-    questions.sort(key=lambda q: q["priority"])
-    by_id     = {q["id"]: q for q in questions}
-    orch_plan = json.dumps(data.get("orchestrations", []), indent=2)
+    data     = load_wizard_yaml()
+    thoughts = _load_stream_thoughts(data)
+    thoughts.sort(key=lambda q: q["priority"])
+    by_id     = {q["id"]: q for q in thoughts}
+    orch_plan = json.dumps(load_orchestration() or {}, indent=2)
 
     git_diff      = _git_diff()
     current_commit = _current_commit()
@@ -1130,26 +1399,26 @@ def run_stream_mode():
 
     stats = wizard_db.get_stream_stats()
     print(color("  Stream mode\n", BOLD, CYAN))
-    print(color(f"  Questions : {len(questions)}", WHITE))
+    print(color(f"  Thoughts  : {len(thoughts)}", WHITE))
     print(color(f"  Last run  : {stats['last_run_at'] or 'never'}", WHITE))
     print(color(f"  Last commit scanned: {stats['last_commit'] or 'none'}\n", WHITE))
     time.sleep(1.2)
 
     run_id   = wizard_db.start_stream_run(current_commit, git_diff)
-    template = load_prompt("stream_question.md")
+    template = load_prompt("stream_thought.md")
 
-    current = questions[0]
+    current = thoughts[0]
     visited = set()
 
     while current and current["id"] not in visited:
-        # STATE 1 — ANSWER: an agent answers the current question.
-        prompt = _build_question_prompt(template, current, git_diff, orch_plan,
-                                        last_commit, current_commit)
+        # STATE 1 — ANSWER: an agent answers the current thought.
+        prompt = _build_thought_prompt(template, current, git_diff, orch_plan,
+                                       last_commit, current_commit)
         answer = conjure(ask, prompt,
                          label=f"Stream [{current['id']}]...", model=DEFAULT_MODEL)
 
         # STATE 2 — ROUTE: the White Wizard judges the answer and picks next.
-        remaining = [q for q in questions
+        remaining = [q for q in thoughts
                      if q["id"] not in visited and q["id"] != current["id"]]
         actionable, nxt = _wizard_route(answer, current, remaining)
 
@@ -1158,7 +1427,9 @@ def run_stream_mode():
             if action == "approve":
                 wizard_db.save_finding(run_id, current["id"], current["priority"], answer, approved=True)
                 if current["id"] == "stream_self_improve":
-                    _try_update_stream_questions(answer, data)
+                    _try_update_stream_thoughts(answer, data)
+                elif current["id"] == "mcp_optimization":
+                    _try_build_mcp_tool(answer, load_orchestration() or {})
             elif action == "skip":
                 wizard_db.save_finding(run_id, current["id"], current["priority"], answer, approved=False)
             elif action == "quit":
@@ -1187,7 +1458,7 @@ def run_stream_mode():
     clear()
     show_header()
     print(color("  Stream complete.\n", BOLD, GOLD))
-    print(color(f"  {len(visited)} question(s) processed.\n", DIM, WHITE))
+    print(color(f"  {len(visited)} thought(s) processed.\n", DIM, WHITE))
 
 
 # ---------------------------------------------------------------------------
@@ -1206,15 +1477,27 @@ def main():
     if files:
         selection = plan_with_ai(files)
     else:
+        selection = None
         while True:
-            selection = select(OPTIONS, "What shall we summon today?")
-            if selection == "__stream__":
+            choice = select(OPTIONS, "What shall we summon today?")
+            if choice is None:
+                break
+            if choice == "__stream__":
                 run_stream_mode()
                 continue
-            if selection is not None and selection not in OPTIONS:
-                _ask_and_show(selection)
+            if choice not in OPTIONS:
+                # Free-form "Something else" query — answer and keep browsing.
+                _ask_and_show(choice)
                 continue
-            break
+            # A concrete build option in a fresh workspace: build it directly,
+            # with no synopsis since there is no existing code to analyse.
+            result = run_team_conversation(
+                choice, "(fresh workspace — no existing code yet)",
+                custom_description=choice,
+            )
+            if result is not None:
+                selection = result
+                break
 
     if selection is None:
         print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
