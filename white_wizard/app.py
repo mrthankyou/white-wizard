@@ -57,17 +57,11 @@ def parse_agent_plan(response):
     a plan. A bare JSON array/string/number — or agents missing a name — returns
     None so the caller treats it as "not a plan yet" instead of crashing.
 
-    Agent prompts routinely embed their own ``` fenced code blocks, so a
-    non-greedy ```json …``` match would stop at the first *inner* fence and
-    truncate the JSON. We match greedily to the last fence, and fall back to
-    scanning for the first brace-delimited object that decodes — which tolerates
-    nested fences, surrounding prose, and trailing text.
+    Tries the full response as JSON first; then scans for a brace-delimited
+    object using raw_decode, which handles nested ``` fences inside agent
+    prompts, surrounding prose, and trailing text.
     """
-    candidates = []
-    m = re.search(r'```(?:json)?\s*(.*)```', response, re.DOTALL)  # greedy: last fence
-    if m:
-        candidates.append(m.group(1).strip())
-    candidates.append(response.strip())
+    candidates = [response.strip()]
     for candidate in candidates:
         try:
             obj = json.loads(candidate)
@@ -811,7 +805,7 @@ def _prompt_orchestration(user_prompt=None, task_mode=False):
     _show_wizard_response(response)
 
 
-def handle_wizard_yaml(path=None):
+def handle_wizard_yaml():
     """The 'existing orchestrations' main menu.
 
     With more than one orchestration, shift+tab cycles the active one and the
@@ -821,16 +815,16 @@ def handle_wizard_yaml(path=None):
     """
     orchs = list_orchestrations()
     active = _read_manifest()["active"]
-    sel = {"i": next((i for i, o in enumerate(orchs)
-                      if o.get("team_folder") == active), 0)}
+    sel_i = next((i for i, o in enumerate(orchs)
+                  if o.get("team_folder") == active), 0)
 
     def current():
-        return orchs[sel["i"]] if orchs else None
+        return orchs[sel_i] if orchs else None
 
     def render_top():
         orch = current()
         if orch:
-            pos = f"  [{sel['i'] + 1}/{len(orchs)}]" if len(orchs) > 1 else ""
+            pos = f"  [{sel_i + 1}/{len(orchs)}]" if len(orchs) > 1 else ""
             print(color(f"  {orch.get('team', 'Orchestration')}{pos}", BOLD, GOLD)
                   + color(f"   ·  {orch.get('created_at', '')}", DIM, WHITE))
             print(color(f"  orchestrator: {orch.get('orchestrator', '')}", DIM, WHITE))
@@ -867,7 +861,7 @@ def handle_wizard_yaml(path=None):
             extra_keys=extra,
         )
         if choice == "__switch__":
-            sel["i"] = (sel["i"] + 1) % len(orchs)
+            sel_i = (sel_i + 1) % len(orchs)
             set_active_orchestration(current().get("team_folder"))
             continue
         if choice is None:
@@ -1453,18 +1447,17 @@ def _try_build_mcp_tool(answer, orch):
     updated = [a for a in spec.get("agents", [])
                if _append_to_subagent(team_folder, _slug(a), note)]
 
-    # Record generated artifacts in the manifest so wipe removes them.
-    path = _manifest_path()
-    if os.path.isfile(path):
-        try:
-            with open(path) as f:
-                manifest = json.load(f)
-            manifest.setdefault("mcp_tools", []).extend(written)
-            manifest.setdefault("mcp_servers", []).append(server_name)
-            with open(path, "w") as f:
-                json.dump(manifest, f, indent=2)
-        except Exception:
-            pass
+    # Record generated artifacts in the active orchestration entry so wipe removes them.
+    try:
+        m = _read_manifest()
+        for o in m["orchestrations"]:
+            if o.get("team_folder") == team_folder:
+                o.setdefault("mcp_tools", []).extend(written)
+                o.setdefault("mcp_servers", []).append(server_name)
+                _write_manifest(m)
+                break
+    except Exception:
+        pass
 
     print(color(f"\n  Built MCP tool '{server_name}' ({len(written)} file(s)); "
                 f"updated {len(updated)} subagent(s).\n", BOLD, GOLD))
@@ -1658,7 +1651,7 @@ def main():
     # built (switch/task/wipe), else the build menu. Looping between them means a
     # wipe or a build lands back on the right menu instead of exiting.
     while True:
-        if load_orchestration():
+        if load_orchestration() or find_wizard_yaml():
             if handle_wizard_yaml() == "__refresh__":
                 continue            # wiped → re-evaluate (other orch, or build menu)
             break                   # user quit

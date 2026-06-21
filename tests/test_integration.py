@@ -126,7 +126,7 @@ class OrchestrationLifecycleTest(unittest.TestCase):
 
         # 3. Wipe via the wipe command.
         self.menu.wipe = True
-        self._run(app.handle_wizard_yaml, app.find_wizard_yaml())
+        self._run(app.handle_wizard_yaml)
 
         # 4. The orchestration — and its MCP registration — is gone.
         self.assertFalse(os.path.exists(team_dir), "team folder not wiped")
