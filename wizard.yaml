@@ -1,0 +1,11 @@
+{
+  "stream": {
+    "questions": [
+      {
+        "id": "test",
+        "priority": 1,
+        "prompt": "hello"
+      }
+    ]
+  }
+}

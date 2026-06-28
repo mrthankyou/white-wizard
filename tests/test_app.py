@@ -1,7 +1,6 @@
 """Unit/integration tests for app-level behaviour and recent bug fixes.
 
 Covers:
-  - _load_stream_thoughts tolerating a malformed wizard.yaml stream section.
   - main() actually building an orchestration in a fresh (codeless) workspace,
     where the build options previously dead-ended at the farewell message.
 
@@ -13,7 +12,9 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -22,31 +23,6 @@ from white_wizard import db as wizard_db
 from white_wizard import ui
 
 from tests.test_integration import CANNED_PLAN, ScriptedMenu
-
-
-class LoadStreamThoughtsTest(unittest.TestCase):
-    def test_valid_thoughts_are_returned(self):
-        thoughts = [{"priority": 1, "id": "a", "prompt": "do a"}]
-        self.assertEqual(app._load_stream_thoughts({"stream": {"thoughts": thoughts}}), thoughts)
-
-    def test_legacy_questions_key_is_accepted(self):
-        q = [{"priority": 2, "id": "b", "prompt": "do b"}]
-        self.assertEqual(app._load_stream_thoughts({"stream": {"questions": q}}), q)
-
-    def test_missing_stream_falls_back_to_defaults(self):
-        self.assertEqual(app._load_stream_thoughts({}), list(app.DEFAULT_STREAM_THOUGHTS))
-
-    def test_malformed_stream_section_does_not_crash(self):
-        # Regression: a non-dict stream or non-list thoughts used to raise.
-        for data in ({"stream": 5}, {"stream": {"thoughts": 5}}, {"stream": []}, []):
-            with self.subTest(data=data):
-                self.assertEqual(
-                    app._load_stream_thoughts(data), list(app.DEFAULT_STREAM_THOUGHTS)
-                )
-
-    def test_invalid_items_are_filtered_then_defaulted(self):
-        bad = {"stream": {"thoughts": [{"id": "x"}, "nope", 3]}}
-        self.assertEqual(app._load_stream_thoughts(bad), list(app.DEFAULT_STREAM_THOUGHTS))
 
 
 class ParseAgentPlanTest(unittest.TestCase):
@@ -242,20 +218,28 @@ class SwitchOrchestrationTest(unittest.TestCase):
         os.chdir(self.origin)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_shift_tab_switches_active(self):
-        calls = []
+    def test_browsing_syncs_active_orchestration(self):
+        # The split pane calls get_state_fn(sel_orch_i) as the user browses
+        # orchestrations; doing so must make the displayed orch the active one,
+        # so wipe and task/adjust act on what's actually on screen.
+        seen = {}
 
-        def fake_menu(options, *a, **k):
-            calls.append(k.get("extra_keys"))
-            return ("__switch__", "") if len(calls) == 1 else (None, "")
+        def fake_pane(get_state_fn, get_options_fn, handle_choice_fn,
+                      handle_task_fn=None):
+            seen["i0"] = get_state_fn(0)["current_orch"]["team_folder"]
+            seen["active_after_0"] = app.load_orchestration()["team_folder"]
+            seen["i1"] = get_state_fn(1)["current_orch"]["team_folder"]
+            seen["active_after_1"] = app.load_orchestration()["team_folder"]
+            return None
 
-        with mock.patch.object(app, "menu", fake_menu):
+        with mock.patch.object(app, "run_split_pane", fake_pane):
             app.handle_wizard_yaml()
 
-        # Started active on sec_team (index 1); one switch wraps to dev_team.
-        self.assertEqual(app.load_orchestration()["team_folder"], "dev_team")
-        # The menu was offered the shift+tab switch key (two orchestrations).
-        self.assertEqual(calls[0], {"shift_tab": "__switch__"})
+        # orchs are in creation order: dev_team (0), sec_team (1).
+        self.assertEqual(seen["i0"], "dev_team")
+        self.assertEqual(seen["active_after_0"], "dev_team")
+        self.assertEqual(seen["i1"], "sec_team")
+        self.assertEqual(seen["active_after_1"], "sec_team")
 
 
 class MainRedirectAfterWipeTest(unittest.TestCase):
@@ -336,10 +320,14 @@ class RealMockBuildTest(unittest.TestCase):
         self._patches = [
             mock.patch.dict(os.environ, {}, clear=True),  # no WHITE_WIZARD_MOCK_REPLY
             mock.patch.object(app, "menu", self.menu),
+            mock.patch.object(app, "select_menu", self.menu),
             mock.patch.object(app, "read_key", lambda: "enter"),
             mock.patch.object(app, "loading", lambda *a, **k: None),
             mock.patch.object(app, "_ensure_mcp", lambda *a, **k: ("ok", "")),
             mock.patch.object(app.time, "sleep", lambda *a, **k: None),
+            # The post-build main menu is a curses UI; quit it immediately so
+            # main() exits after the build rather than starting curses.
+            mock.patch.object(app, "run_split_pane", lambda *a, **k: None),
         ]
         for p in self._patches:
             p.start()
@@ -371,10 +359,14 @@ class FreshWorkspaceBuildTest(unittest.TestCase):
         self._patches = [
             mock.patch.dict(os.environ, {"WHITE_WIZARD_MOCK_REPLY": CANNED_PLAN}),
             mock.patch.object(app, "menu", self.menu),
+            mock.patch.object(app, "select_menu", self.menu),
             mock.patch.object(app, "read_key", lambda: "enter"),
             mock.patch.object(app, "loading", lambda *a, **k: None),
             mock.patch.object(app, "_ensure_mcp", lambda *a, **k: ("ok", "")),
             mock.patch.object(app.time, "sleep", lambda *a, **k: None),
+            # The post-build main menu is a curses UI; quit it immediately so
+            # main() exits after the build rather than starting curses.
+            mock.patch.object(app, "run_split_pane", lambda *a, **k: None),
         ]
         for p in self._patches:
             p.start()
@@ -398,6 +390,214 @@ class FreshWorkspaceBuildTest(unittest.TestCase):
         )
         md_files = [f for f in os.listdir(team_dirs[0]) if f.endswith(".md")]
         self.assertTrue(any("orchestrator" in f for f in md_files), "no orchestrator subagent")
+
+
+class RunSingleTaskWhilePausedTest(unittest.TestCase):
+    """A user can run one hand-picked task from the right pane while the stream
+    is paused, without re-enabling the whole stream."""
+
+    def setUp(self):
+        self.origin = os.getcwd()
+        self.tmp = tempfile.mkdtemp(prefix="ww_oneshot_")
+        os.chdir(self.tmp)
+        os.makedirs(os.path.join(self.tmp, ".claude", "agents"))
+        wizard_db.init_db()
+        app._save_orchestration({
+            "created_at": "2026-06-27", "team": "Dev Team", "team_folder": "dev_team",
+            "orchestrator": "dev-orchestrator", "agents": [{"name": "a"}],
+            "transitions": [], "mcp_tools": [], "mcp_servers": [],
+        })
+
+    def tearDown(self):
+        os.chdir(self.origin)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_run_task_once_executes_while_disabled(self):
+        folder = "dev_team"
+        wizard_db.set_stream_enabled(folder, False)
+        tid = wizard_db.add_task(folder, "add a smoke test", "user", is_user_prompt=True)
+        orch = app.load_orchestration()
+
+        with mock.patch.dict(os.environ, {"WHITE_WIZARD_MOCK_REPLY": "ok"}, clear=True):
+            app._run_task_once(orch, {"id": tid, "description": "add a smoke test",
+                                      "task_type": "user"})
+            for _ in range(40):  # up to ~2s for the one-shot thread to finish
+                row = next(t for t in wizard_db.get_tasks_for_orch(folder) if t["id"] == tid)
+                if row["status"] == "done":
+                    break
+                time.sleep(0.05)
+
+        self.assertEqual(row["status"], "done")
+        # The stream itself stays paused — only the one task ran.
+        self.assertFalse(wizard_db.is_stream_enabled(folder))
+
+    def test_user_task_failed_when_no_file_changes(self):
+        """In a git repo, a user task that produces no file changes is recorded
+        as 'failed' rather than a false 'done'."""
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        subprocess.run(["git", "init", "-q"], cwd=self.tmp, check=True)
+        folder = "dev_team"
+        wizard_db.set_stream_enabled(folder, False)
+        tid = wizard_db.add_task(folder, "add tests", "user", is_user_prompt=True)
+        orch = app.load_orchestration()
+
+        with mock.patch.dict(os.environ,
+                             {"WHITE_WIZARD_MOCK_REPLY": "I changed nothing"}, clear=True):
+            app._run_task_once(orch, {"id": tid, "description": "add tests",
+                                      "task_type": "user"})
+            for _ in range(40):
+                row = next(t for t in wizard_db.get_tasks_for_orch(folder) if t["id"] == tid)
+                if row["status"] in ("done", "failed"):
+                    break
+                time.sleep(0.05)
+
+        self.assertEqual(row["status"], "failed")
+
+    def test_git_commit_helper_commits_only_listed_files(self):
+        """_git_commit stages and commits exactly the given paths, leaving an
+        unrelated dirty file untouched."""
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        for args in (["init", "-q"], ["config", "user.email", "t@t"],
+                     ["config", "user.name", "t"]):
+            subprocess.run(["git", *args], cwd=self.tmp, check=True)
+        with open(os.path.join(self.tmp, "new.py"), "w") as f:
+            f.write("x = 1\n")
+        with open(os.path.join(self.tmp, "other.txt"), "w") as f:  # unrelated WIP
+            f.write("work in progress\n")
+
+        ref = app._git_commit(["new.py"], "add new.py\n\nbody")
+
+        self.assertTrue(ref)
+        names = subprocess.run(
+            ["git", "show", "--name-only", "--format=", "HEAD"],
+            cwd=self.tmp, capture_output=True, text=True).stdout.split()
+        self.assertIn("new.py", names)
+        self.assertNotIn("other.txt", names)   # unrelated dirty file left alone
+        # The unrelated file is still present and uncommitted.
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "other.txt")))
+
+    def test_auto_commit_off_changes_without_committing(self):
+        """With auto-commit disabled, a task still makes (and reports) changes
+        but does not create a commit."""
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        for args in (["init", "-q"], ["config", "user.email", "t@t"],
+                     ["config", "user.name", "t"],
+                     ["commit", "-q", "--allow-empty", "-m", "init"]):
+            subprocess.run(["git", *args], cwd=self.tmp, check=True)
+        app._set_auto_commit(False)
+        self.assertFalse(app._auto_commit_enabled())
+
+        worker = app.StreamWorker({"team": "Dev Team", "team_folder": "dev_team",
+                                   "model": "m"})
+
+        def fake_run_task(prompt, **kw):
+            with open(os.path.join(self.tmp, "f.py"), "w") as fh:
+                fh.write("x = 1\n")
+            return "made f.py"
+
+        with mock.patch.object(app, "run_task", fake_run_task):
+            ok, summary = worker._run_user_task("add f")
+
+        self.assertTrue(ok)
+        self.assertIn("auto-commit off", summary)
+        # No new commit beyond the initial one.
+        count = subprocess.run(["git", "rev-list", "--count", "HEAD"],
+                               cwd=self.tmp, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(count, "1")
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "f.py")))  # change made
+
+    def test_commit_subject_uses_agent_summary_not_prompt(self):
+        """The commit subject is the agent's one-line summary of what it changed,
+        not the raw task prompt."""
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        for args in (["init", "-q"], ["config", "user.email", "t@t"],
+                     ["config", "user.name", "t"],
+                     ["commit", "-q", "--allow-empty", "-m", "init"]):
+            subprocess.run(["git", *args], cwd=self.tmp, check=True)
+
+        worker = app.StreamWorker({"team": "Dev Team", "team_folder": "dev_team",
+                                   "model": "m"})
+
+        def fake_run_task(prompt, **kw):
+            with open(os.path.join(self.tmp, "g.py"), "w") as fh:
+                fh.write("def greet():\n    return 'hi'\n")
+            return "Add greeting helper to g.py\n(plus a couple of details)"
+
+        with mock.patch.object(app, "run_task", fake_run_task):
+            ok, summary = worker._run_user_task("make a greeting")
+
+        self.assertTrue(ok)
+        subject = subprocess.run(["git", "log", "-1", "--format=%s"],
+                                 cwd=self.tmp, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(subject, "Add greeting helper to g.py")  # summary, not "make a greeting"
+
+    def test_edit_to_existing_untracked_file_is_detected(self):
+        """Editing a pre-existing untracked file (common in a fresh repo) counts
+        as a real change — not a false 'no changes / failed'."""
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        subprocess.run(["git", "init", "-q"], cwd=self.tmp, check=True)
+        with open(os.path.join(self.tmp, "existing.py"), "w") as f:
+            f.write("old\n")                       # untracked, never added
+
+        worker = app.StreamWorker({"team": "Dev Team", "team_folder": "dev_team",
+                                   "model": "m"})
+
+        def fake_run_task(prompt, **kw):
+            with open(os.path.join(self.tmp, "existing.py"), "w") as fh:
+                fh.write("new content here\n")      # edit the untracked file
+            return "Updated existing.py"
+
+        with mock.patch.object(app, "run_task", fake_run_task):
+            ok, summary = worker._run_user_task("update it")
+
+        self.assertTrue(ok)                          # detected as a change…
+        self.assertNotIn("no file changes", summary) # …not a false failure
+
+
+class WipeAndPruneTest(unittest.TestCase):
+    """Wiping an orchestration also clears its tasks/stream_config from the DB,
+    and a startup prune removes state left by orchestrations wiped earlier."""
+
+    def setUp(self):
+        self.origin = os.getcwd()
+        self.tmp = tempfile.mkdtemp(prefix="ww_wipe_")
+        os.chdir(self.tmp)
+        os.makedirs(os.path.join(self.tmp, ".claude", "agents", "dev_team"))
+        wizard_db.init_db()
+        app._save_orchestration({
+            "created_at": "2026-06-28", "team": "Dev Team", "team_folder": "dev_team",
+            "orchestrator": "dev-orchestrator", "agents": [{"name": "a"}],
+            "transitions": [], "mcp_tools": [], "mcp_servers": [],
+        })
+
+    def tearDown(self):
+        os.chdir(self.origin)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_wipe_removes_the_orchs_tasks_and_config(self):
+        wizard_db.add_task("dev_team", "do x", "user", is_user_prompt=True)
+        wizard_db.add_task("dev_team", "scan", "bug")
+        wizard_db.set_stream_enabled("dev_team", False)
+        self.assertEqual(len(wizard_db.get_tasks_for_orch("dev_team")), 2)
+
+        app.wipe_orchestration("dev_team")
+
+        self.assertEqual(wizard_db.get_tasks_for_orch("dev_team"), [])
+        # config row gone → is_stream_enabled falls back to the default (True)
+        self.assertTrue(wizard_db.is_stream_enabled("dev_team"))
+
+    def test_prune_removes_orphaned_tasks_only(self):
+        wizard_db.add_task("dev_team", "keep me", "user")    # known orch
+        wizard_db.add_task("ghost_team", "orphan", "bug")    # wiped/unknown orch
+        removed = wizard_db.prune_orphaned_state({"dev_team"})
+        self.assertEqual(removed, 1)
+        self.assertEqual(len(wizard_db.get_tasks_for_orch("dev_team")), 1)
+        self.assertEqual(wizard_db.get_tasks_for_orch("ghost_team"), [])
 
 
 if __name__ == "__main__":

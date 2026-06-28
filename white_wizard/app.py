@@ -5,17 +5,21 @@ import datetime
 import importlib.resources
 import itertools
 import json
+import logging
+import logging.handlers
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
-from white_wizard.ai_client import ask, ask_with_history
+from white_wizard.ai_client import ask, ask_with_history, kill_current, run_task
 from white_wizard import db as wizard_db
 from white_wizard.ui import (
     BOLD, DIM, WHITE, GOLD, CYAN, GRAY, DANGER, BRIGHT_BLUE,
-    color, clear, show_header, read_key, Option, menu, SPINNER_FRAMES,
+    color, clear, show_header, show_header_compact, read_key, Option, menu, select_menu,
+    SPINNER_FRAMES, run_split_pane,
 )
 
 # ---------------------------------------------------------------------------
@@ -57,17 +61,11 @@ def parse_agent_plan(response):
     a plan. A bare JSON array/string/number — or agents missing a name — returns
     None so the caller treats it as "not a plan yet" instead of crashing.
 
-    Agent prompts routinely embed their own ``` fenced code blocks, so a
-    non-greedy ```json …``` match would stop at the first *inner* fence and
-    truncate the JSON. We match greedily to the last fence, and fall back to
-    scanning for the first brace-delimited object that decodes — which tolerates
-    nested fences, surrounding prose, and trailing text.
+    Tries the full response as JSON first; then scans for a brace-delimited
+    object using raw_decode, which handles nested ``` fences inside agent
+    prompts, surrounding prose, and trailing text.
     """
-    candidates = []
-    m = re.search(r'```(?:json)?\s*(.*)```', response, re.DOTALL)  # greedy: last fence
-    if m:
-        candidates.append(m.group(1).strip())
-    candidates.append(response.strip())
+    candidates = [response.strip()]
     for candidate in candidates:
         try:
             obj = json.loads(candidate)
@@ -241,70 +239,6 @@ def render_infographic(plan, team_name=""):
 # wizard.yaml helpers
 # ---------------------------------------------------------------------------
 
-# Stream mode maintains; it does not build. Every thought serves one of two
-# axes: PRIMARY — keep the AI orchestration system healthy; SECONDARY — maintain
-# the codebase via refactors and bug fixes (never new features).
-DEFAULT_STREAM_THOUGHTS = [
-    # Primary axis — the AI orchestration system.
-    {
-        "priority": 1,
-        "id": "orch_drift",
-        "prompt": (
-            "PRIMARY FOCUS — the AI orchestration system. Review the latest code "
-            "and git diff against the current orchestration. Has the codebase "
-            "changed in a way that the agent team should change to stay aligned? "
-            "Are any subagents now missing, overlapping, or mis-scoped? Propose "
-            "orchestration updates only — do not propose new product features."
-        ),
-    },
-    {
-        "priority": 2,
-        "id": "mcp_optimization",
-        "prompt": (
-            "PRIMARY FOCUS — the AI orchestration system. Look across the "
-            "orchestration's subagents. Do several of them run the same command "
-            "(build, test, lint, deploy, a query) or repeat the same multi-step "
-            "procedure? If so, that command is a candidate to become a dedicated "
-            "MCP tool the subagents call directly. If you find a good one, build "
-            "the MCP tool and update the subagents that used the raw command to "
-            "use it instead."
-        ),
-    },
-    # Secondary axis — codebase maintenance (refactor + fix, never new features).
-    {
-        "priority": 3,
-        "id": "bug_scan",
-        "prompt": (
-            "SECONDARY FOCUS — codebase maintenance. Are there any bugs in the "
-            "codebase that should be surfaced as a proposed fix? Maintenance only "
-            "— do not propose new features."
-        ),
-    },
-    {
-        "priority": 4,
-        "id": "code_health",
-        "prompt": (
-            "SECONDARY FOCUS — codebase maintenance. Is there old, duplicated, "
-            "dead, or overly complex code worth refactoring for maintainability "
-            "and simplicity? Propose maintenance refactors only — never new "
-            "features, and do not add complexity."
-        ),
-    },
-    # Meta — let stream mode improve its own thoughts.
-    {
-        "priority": 5,
-        "id": "stream_self_improve",
-        "prompt": (
-            "Review the thoughts currently saved in stream mode (wizard.yaml). "
-            "Are any improvements, new thoughts, or refactorings needed to better "
-            "keep the orchestration healthy and the codebase maintained — without "
-            "unnecessarily adding complexity? If so, return the revised thought "
-            "list as a JSON code block."
-        ),
-    },
-]
-
-
 def find_wizard_yaml():
     path = os.path.join(os.getcwd(), "wizard.yaml")
     return path if os.path.isfile(path) else None
@@ -328,16 +262,77 @@ def save_wizard_yaml_data(data):
 
 
 def ensure_wizard_config(model):
-    """Make sure wizard.yaml holds the wizard's own config (settings + stream).
+    """Make sure wizard.yaml holds the wizard's own settings config.
 
     Orchestration data is never written here — it lives in the AI's own store
     (.claude/ for Claude). Any legacy orchestrations are stripped out.
     """
     data = load_wizard_yaml()
     data.setdefault("settings", {"default_model": model})
-    data.setdefault("stream", {"thoughts": DEFAULT_STREAM_THOUGHTS})
     data.pop("orchestrations", None)
     save_wizard_yaml_data(data)
+
+
+def _auto_commit_enabled():
+    """Whether completed tasks auto-commit their changes (wizard.yaml setting,
+    default on)."""
+    return bool(load_wizard_yaml().get("settings", {}).get("auto_commit", True))
+
+
+def _set_auto_commit(enabled):
+    """Persist the auto-commit preference to wizard.yaml settings."""
+    data = load_wizard_yaml()
+    data.setdefault("settings", {})["auto_commit"] = bool(enabled)
+    save_wizard_yaml_data(data)
+
+
+# ---------------------------------------------------------------------------
+# Alert queue — lets one action push a message that the next menu screen shows
+# ---------------------------------------------------------------------------
+
+_pending_alerts: list = []
+
+
+def push_alert(msg: str) -> None:
+    _pending_alerts.append(msg)
+
+
+def pop_alerts() -> list:
+    result = list(_pending_alerts)
+    _pending_alerts.clear()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Activity log — a persistent trace of the task queue / stream-worker lifecycle
+# under .wizard/stream.log (gitignored), for debugging the background system.
+# ---------------------------------------------------------------------------
+
+_stream_logger = None
+
+
+def _stream_log(msg: str) -> None:
+    """Append a timestamped line to .wizard/stream.log. Thread-safe and
+    best-effort — logging never interferes with the work it records. Always-on,
+    so the handler rotates at 2 MB (3 backups kept) to stay bounded."""
+    global _stream_logger
+    try:
+        if _stream_logger is None:
+            wizard_dir = os.path.join(os.getcwd(), ".wizard")
+            os.makedirs(wizard_dir, exist_ok=True)
+            logger = logging.getLogger("white_wizard.stream")
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+            if not logger.handlers:
+                handler = logging.handlers.RotatingFileHandler(
+                    os.path.join(wizard_dir, "stream.log"),
+                    maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+                handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+                logger.addHandler(handler)
+            _stream_logger = logger
+        _stream_logger.info(msg)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +698,15 @@ def wipe_orchestration(team_folder=None):
     targets += [os.path.join(cwd, rel) for rel in target.get("mcp_tools", []) if rel]
     removed = [os.path.relpath(p, cwd) for p in dict.fromkeys(targets) if _remove_path(p)]
 
+    # Clear this orchestration's operational state from the DB too, so its tasks
+    # don't linger as orphans (and can't resurface if a team with the same folder
+    # is rebuilt later).
+    if folder:
+        n_tasks = wizard_db.delete_tasks_for_orch(folder)
+        wizard_db.delete_stream_config(folder)
+        if n_tasks:
+            removed.append(f"{n_tasks} queued/finished task(s)")
+
     # Unregister this orchestration's MCP servers without clobbering user ones.
     if _unregister_mcp_servers(target.get("mcp_servers", [])):
         removed.append(".mcp.json (entries removed)")
@@ -727,7 +731,7 @@ def wipe_orchestration(team_folder=None):
 def _confirm_and_wipe():
     """Confirm (with a danger warning) and wipe the active orchestration.
 
-    Returns True if anything was wiped.
+    Returns (wiped: bool, name: str | None).
     """
     name = (load_orchestration() or {}).get("team", "this orchestration")
 
@@ -744,21 +748,10 @@ def _confirm_and_wipe():
         render_top=render_top,
     )
     if value is not True:
-        return False
+        return False, None
 
     removed = wipe_orchestration()
-    clear()
-    show_header()
-    if removed:
-        print(color(f"  '{name}' wiped.\n", BOLD, GOLD))
-        for item in removed:
-            print(color(f"    - {item}", DIM, WHITE))
-    else:
-        print(color("  Nothing to wipe — no orchestration found.\n", DIM, WHITE))
-    print()
-    print(color("  Press any key to continue...", DIM, WHITE))
-    read_key()
-    return bool(removed)
+    return bool(removed), name if removed else None
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +761,7 @@ def _confirm_and_wipe():
 def _show_wizard_response(response):
     """Render a Claude response in the wizard frame and wait for a keypress."""
     clear()
-    show_header()
+    show_header_compact()
     print(color("  Wizard\n", BOLD, CYAN))
     print(color("  " + "─" * 50, DIM, WHITE))
     for line in response.splitlines():
@@ -784,21 +777,12 @@ def _ask_and_show(query):
     _show_wizard_response(response)
 
 
-def _prompt_orchestration(user_prompt=None, task_mode=False):
+def _prompt_orchestration(user_prompt=None):
     """Call Claude with the orchestration context and display the response."""
     orch      = load_orchestration() or {}
     orch_json = json.dumps(orch, indent=2)
-    team      = orch.get("team", "dev team")
 
-    if task_mode and user_prompt:
-        prompt = (
-            f"You are the orchestrator for a multi-agent {team}.\n\n"
-            f"The user wants the team to: {user_prompt}\n\n"
-            f"Based on the plan below, outline which agents should handle this task, "
-            f"in what order, and what each agent should specifically do.\n\n"
-            f"Orchestration plan:\n{orch_json}"
-        )
-    elif user_prompt:
+    if user_prompt:
         prompt = (
             "You are advising on a multi-agent orchestration built with White Wizard.\n\n"
             f"Orchestration plan:\n{orch_json}\n\n"
@@ -811,78 +795,164 @@ def _prompt_orchestration(user_prompt=None, task_mode=False):
     _show_wizard_response(response)
 
 
-def handle_wizard_yaml(path=None):
-    """The 'existing orchestrations' main menu.
+def _show_diagram():
+    """Full-screen infographic of the active orchestration. Press any key to return."""
+    orch = load_orchestration()
+    clear()
+    show_header_compact()
+    if not orch or not orch.get("agents"):
+        print(color("  No diagram available — orchestration has no agents.\n", DIM, WHITE))
+    else:
+        print(render_infographic(orch, team_name=orch.get("team", "")))
+    print(color("  Press any key to return...", DIM, WHITE))
+    read_key()
 
-    With more than one orchestration, shift+tab cycles the active one and the
-    panel updates (name, orchestrator, subagents in order of operations). The
-    active selection drives task/manage/stream/wipe. Returns "__refresh__" when
-    state changed (e.g. a wipe) so the caller re-evaluates, or None to quit.
+
+def handle_wizard_yaml():
+    """The 'existing orchestrations' main menu — curses split-pane UI.
+
+    Left pane: wizard hat, alerts, orch info, option list.
+    Right pane: task list and stream summary for the current orch.
+    Returns "__refresh__" when state changed (e.g. a wipe) so the caller
+    re-evaluates routing, or None to quit.
     """
-    orchs = list_orchestrations()
-    active = _read_manifest()["active"]
-    sel = {"i": next((i for i, o in enumerate(orchs)
-                      if o.get("team_folder") == active), 0)}
+    # Shared mutable state between the three closures below.
+    shared = {"mode": "main", "alerts": pop_alerts()}
 
-    def current():
-        return orchs[sel["i"]] if orchs else None
+    def get_state_fn(sel_orch_i):
+        orchs  = list_orchestrations()
+        sel    = min(sel_orch_i, len(orchs) - 1) if orchs else 0
+        orch   = orchs[sel] if orchs else None
+        folder = orch.get("team_folder") if orch else None
+        # Keep the active orchestration in sync with the one on screen, so wipe
+        # and task/adjust (which act on the active orch) target what the user
+        # is looking at. Guarded so we only write the manifest on a real change.
+        if folder and shared.get("active") != folder:
+            set_active_orchestration(folder)
+            shared["active"] = folder
+        alerts = list(shared["alerts"])
+        shared["alerts"].clear()  # show once per refresh cycle
+        return {
+            "orchs":          orchs,
+            "current_orch":   orch,
+            "agent_names":    _ordered_agent_names(orch) if orch else [],
+            "alerts":         alerts,
+            "mode":           shared["mode"],
+            "stream_enabled": wizard_db.is_stream_enabled(folder) if folder else True,
+            "auto_commit":    _auto_commit_enabled(),
+            "tasks":          wizard_db.get_tasks_for_orch(folder) if folder else [],
+        }
 
-    def render_top():
-        orch = current()
-        if orch:
-            pos = f"  [{sel['i'] + 1}/{len(orchs)}]" if len(orchs) > 1 else ""
-            print(color(f"  {orch.get('team', 'Orchestration')}{pos}", BOLD, GOLD)
-                  + color(f"   ·  {orch.get('created_at', '')}", DIM, WHITE))
-            print(color(f"  orchestrator: {orch.get('orchestrator', '')}", DIM, WHITE))
-            print(color("  subagents (in order):", DIM, WHITE))
-            for n, name in enumerate(_ordered_agent_names(orch), 1):
-                print(color(f"    {n}. {name}", WHITE))
-            if len(orchs) > 1:
-                print(color("\n  shift+tab — switch orchestration", DIM, BRIGHT_BLUE))
-        else:
-            print(color("  No orchestration in .claude/ yet.", DIM, WHITE))
-        print()
-
-    while True:
-        orch = current()
+    def get_options_fn(state):
+        orch = state.get("current_orch")
         team = orch.get("team", "team") if orch else "team"
+        if state.get("mode") == "manage":
+            return [
+                Option("adjust", "Adjust the orchestration", text_input=True,
+                       placeholder="What should change?"),
+                Option("back",   "← Back"),
+            ]
         task_label = f"What do you want the {team} to do?"
-        options = [
-            Option("task",   task_label, text_input=True, placeholder=task_label),
-            Option("manage", "Manage the system"),
-            Option("other",  "Something else", text_input=True,
+        stream_label = "Disable stream" if state.get("stream_enabled") else "Enable stream"
+        ac_label = ("Disable auto-commit" if state.get("auto_commit", True)
+                    else "Enable auto-commit")
+        return [
+            Option("task",          task_label, text_input=True, placeholder=task_label),
+            Option("manage",        "Manage the system"),
+            Option("build",         "Build a new team"),
+            Option("diagram",       "View diagram"),
+            Option("other",         "Something else", text_input=True,
                    placeholder="Something else"),
-            Option("stream", "Start streaming"),
-            Option("wipe",   "Wipe the orchestration system"),
+            Option("stream_toggle", stream_label),
+            Option("autocommit_toggle", ac_label),
+            Option("wipe",          "Wipe the orchestration system"),
+            Option("quit",          "Quit (stop background AI)"),
         ]
-        multi = len(orchs) > 1
-        extra = {"shift_tab": "__switch__"} if multi else {}
-        hint = ("(arrows · Enter to choose · shift+tab to switch · q to quit)" if multi
-                else "(arrows · Enter to choose · q to quit)")
 
-        choice, text = menu(
-            options,
-            hint=hint,
-            render_top=render_top,
-            extra_keys=extra,
-        )
-        if choice == "__switch__":
-            sel["i"] = (sel["i"] + 1) % len(orchs)
-            set_active_orchestration(current().get("team_folder"))
-            continue
+    def handle_choice_fn(choice, text, state):
+        orch = state.get("current_orch")
         if choice is None:
-            return None
-        if choice == "stream":
-            run_stream_mode()
-        elif choice == "wipe":
-            if _confirm_and_wipe():
+            # ESC / q
+            if shared["mode"] == "manage":
+                shared["mode"] = "main"
+                return None  # stay in pane
+            return "__quit__"
+
+        if shared["mode"] == "manage":
+            if choice == "back":
+                shared["mode"] = "main"
+            elif choice == "adjust" and text:
+                _prompt_orchestration(text)
+        else:
+            if choice == "wipe":
+                folder_before_wipe = orch.get("team_folder", "") if orch else ""
+                wiped, name = _confirm_and_wipe()
+                if wiped:
+                    _stop_stream_worker(folder_before_wipe)
+                    push_alert(f"'{name}' wiped successfully.")
+                    return "__refresh__"
+            elif choice == "manage":
+                shared["mode"] = "manage"
+            elif choice == "build":
+                _first_menu()
                 return "__refresh__"
-        elif choice == "manage":
-            _prompt_orchestration()
-        elif choice == "task" and text:
-            _prompt_orchestration(text, task_mode=True)
-        elif choice == "other" and text:
-            _prompt_orchestration(text)
+            elif choice == "task" and text and orch:
+                # A team request runs as a background task in the right pane
+                # (prioritised), not a separate blocking screen. If the stream is
+                # on, the worker picks it up; if paused, kick a one-shot run so
+                # the explicit request still runs.
+                folder = orch.get("team_folder", "")
+                tid = wizard_db.add_task(folder, text, "user", is_user_prompt=True)
+                _stream_log(f"[{folder}] queued user task #{tid}: {text}")
+                if wizard_db.is_stream_enabled(folder):
+                    shared["alerts"] = [f"Queued for the team: {text[:50]}"]
+                else:
+                    _run_task_once(orch, {"id": tid, "description": text,
+                                          "task_type": "user"})
+                    shared["alerts"] = [f"Running: {text[:50]}"]
+            elif choice == "diagram":
+                _show_diagram()
+            elif choice == "other" and text:
+                _prompt_orchestration(text)
+            elif choice == "stream_toggle" and orch:
+                folder = orch.get("team_folder", "")
+                currently_enabled = wizard_db.is_stream_enabled(folder)
+                wizard_db.set_stream_enabled(folder, not currently_enabled)
+                if not currently_enabled:  # was off, now turning on
+                    _start_stream_workers()
+                status = "disabled" if currently_enabled else "enabled"
+                _stream_log(f"[{folder}] stream {status} by user")
+                shared["alerts"] = [f"Stream {status}."]
+            elif choice == "autocommit_toggle":
+                now_on = _auto_commit_enabled()
+                _set_auto_commit(not now_on)
+                status = "disabled" if now_on else "enabled"
+                _stream_log(f"auto-commit {status} by user")
+                shared["alerts"] = [f"Auto-commit {status}."]
+            elif choice == "quit":
+                return "__quit__"
+        return None  # stay in pane, redraw
+
+    def handle_task_fn(task, state):
+        """Run a single highlighted task on demand from the right pane.
+
+        Only acts on a not-yet-run task. When the stream is paused this is the
+        way to run one task without turning the whole stream back on; when the
+        stream is on, the worker already runs it, so we just note that.
+        """
+        orch = state.get("current_orch")
+        if not orch or not task or task.get("status") != "pending":
+            return None
+        folder = orch.get("team_folder", "")
+        if wizard_db.is_stream_enabled(folder):
+            shared["alerts"] = ["Stream is on — it runs queued tasks automatically."]
+            return None
+        _run_task_once(orch, task)
+        shared["alerts"] = [f"Running: {task.get('description', '')[:50]}"]
+        return None
+
+    return run_split_pane(get_state_fn, get_options_fn, handle_choice_fn,
+                          handle_task_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -931,7 +1001,8 @@ def scan_workspace():
         sys.stdout.flush()
         time.sleep(0.08)
 
-    sys.stdout.write("\r" + " " * 64 + "\r")
+    clear_w = 9 + len(f"Scanning '{name}' for existing code... ") + len(count) + 2
+    sys.stdout.write("\r" + " " * clear_w + "\r")
     if files:
         plural = "s" if len(files) != 1 else ""
         print(color(f"  + Found {len(files)} code file{plural} in this workspace.", BOLD, GOLD))
@@ -959,7 +1030,7 @@ def select(options, title,
     """Pick one of ``options`` (a list of label strings).
 
     Returns the chosen label, the typed text for the custom option,
-    "__stream__" for the stream shortcut, or None if cancelled.
+    or None if cancelled.
     """
     opts = [
         Option(o, o,
@@ -969,14 +1040,8 @@ def select(options, title,
         for o in options
     ]
 
-    def footer():
-        print(color("  " + "─" * 40, DIM, WHITE))
-        print(color("  s  ·  Stream mode", DIM, WHITE))
-        print()
-
-    value, text = menu(opts, title, hint=hint, footer=footer,
-                       extra_keys={"s": "__stream__", "S": "__stream__"})
-    if value is None or value == "__stream__":
+    value, text = select_menu(opts, title, hint=hint)
+    if value is None:
         return value
     if value == CUSTOM_OPTION:
         return text or "a custom orchestration system"
@@ -1056,11 +1121,6 @@ TEAM_PROMPTS = {
 }
 
 
-def parse_generated_files(response):
-    pattern = r'### FILE: ([^\n]+)\n```[a-zA-Z]*\n(.*?)```'
-    return [(p.strip(), c.strip()) for p, c in re.findall(pattern, response, re.DOTALL)]
-
-
 def _ensure_mcp():
     """Make sure the `mcp` package (needed by the generated state machine) is
     installed, installing it with pip if missing.
@@ -1072,17 +1132,40 @@ def _ensure_mcp():
     import importlib.util
     if importlib.util.find_spec("mcp") is not None:
         return ("ok", "")
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "mcp"],
+
+    def _pip(*args):
+        return subprocess.run(
+            [sys.executable, "-m", "pip", *args],
             capture_output=True, text=True,
         )
+
+    try:
+        proc = _pip("install", "mcp")
+        if proc.returncode == 0:
+            return ("installed", "")
+        # Older pip versions can't resolve some packages — upgrade pip and retry.
+        _pip("install", "--upgrade", "pip")
+        proc = _pip("install", "mcp")
+        if proc.returncode == 0:
+            return ("installed", "")
     except Exception as exc:
         return ("fail", str(exc))
-    if proc.returncode == 0:
-        return ("installed", "")
-    out = (proc.stderr or proc.stdout).strip()
-    return ("fail", out.splitlines()[-1] if out else f"pip exited {proc.returncode}")
+
+    # Last resort: try uv if it's on PATH.
+    uv_proc = None
+    try:
+        uv_proc = subprocess.run(
+            ["uv", "pip", "install", "mcp"],
+            capture_output=True, text=True,
+        )
+        if uv_proc.returncode == 0:
+            return ("installed", "")
+    except Exception:
+        pass
+
+    last = uv_proc if uv_proc is not None else proc
+    out  = (last.stderr or last.stdout).strip()
+    return ("fail", out.splitlines()[-1] if out else f"install failed (exit {last.returncode})")
 
 
 def _smoke_test(team_dir, orch):
@@ -1163,7 +1246,7 @@ def show_orchestration_created(team_selection, team_dir, smoke_ok=None, smoke_ch
                                mcp_status=None, mcp_detail=""):
     """Show the Claude-native subagent files that were written, smoke-test results, and how to run."""
     clear()
-    show_header()
+    show_header_compact()
     team_label = team_selection.replace("Create ", "").title()
     orch = load_orchestration() or {}
     rel  = os.path.relpath(team_dir, os.getcwd())
@@ -1193,14 +1276,13 @@ def show_orchestration_created(team_selection, team_dir, smoke_ok=None, smoke_ch
     print()
     print(color(f"  Lead orchestrator: {orch.get('orchestrator', 'orchestrator')}  "
                 "(delegates via the state-machine MCP tool)", DIM, WHITE))
-    print(color("  Your team is ready. Next you'll land at the prompt where you can", DIM, WHITE))
-    print(color("  give the team a task to run — or let the wizard prompt the AI for you.\n",
-                BOLD, GOLD))
-    print(color("  Press any key to continue to the prompt...", DIM, WHITE))
-    read_key()
+    print(color("  Your team is ready.\n", BOLD, GOLD))
 
 
 def run_team_conversation(team_selection, synopsis, custom_description=""):
+    clear()
+    show_header_compact()
+
     prompt_file     = TEAM_PROMPTS.get(team_selection, "team_custom.md")
     template        = load_prompt(prompt_file)
     if "{team_description}" in template:
@@ -1225,7 +1307,7 @@ def run_team_conversation(team_selection, synopsis, custom_description=""):
 
     if not plan:
         clear()
-        show_header()
+        show_header_compact()
         print(color("  The wizard could not produce an orchestration plan.\n", BOLD, GOLD))
         for line in response.splitlines():
             print(color("  " + line, WHITE))
@@ -1237,7 +1319,7 @@ def run_team_conversation(team_selection, synopsis, custom_description=""):
     # Show the orchestration and build it for them, keeping the diagram on
     # screen for at least 15s so it can actually be read.
     clear()
-    show_header()
+    show_header_compact()
     print(render_infographic(plan, team_name=team_selection))
     print()
     build_start = time.time()
@@ -1257,6 +1339,41 @@ def run_team_conversation(team_selection, synopsis, custom_description=""):
         loading("Finalising the orchestration...", seconds=remaining)
 
     show_orchestration_created(team_selection, team_dir, ok, checks, mcp_status, mcp_detail)
+
+    # Ask the AI for any project-specific stream tasks based on what it just built.
+    extra_stream_tasks = []
+    try:
+        extra_prompt = (
+            "Based on this project, propose up to 4 project-specific recurring "
+            "stream tasks for a background code review agent. Each should be "
+            "specific to what this project actually does.\n\n"
+            f"Project synopsis:\n{synopsis[:800]}\n\n"
+            "Return ONLY a JSON array:\n"
+            '[{"task_type":"bug|test|refactor|doc","description":"short task (max 150 chars)"}]\n'
+            "Return [] if no project-specific tasks needed. No other text."
+        )
+        raw = conjure(ask, extra_prompt, label="Generating stream tasks...",
+                      model=DEFAULT_MODEL)
+        m = re.search(r'\[.*\]', raw, re.DOTALL)
+        if m:
+            items = json.loads(m.group(0))
+            if isinstance(items, list):
+                extra_stream_tasks = [
+                    (i.get("task_type", "bug"), i.get("description", "")[:150])
+                    for i in items[:4] if i.get("description")
+                ]
+    except Exception:
+        pass
+
+    # Start the stream worker for this newly built orchestration.
+    orch_built = load_orchestration()
+    if orch_built:
+        folder = orch_built.get("team_folder")
+        if folder and folder not in _stream_workers:
+            w = StreamWorker(orch_built, extra_tasks=extra_stream_tasks)
+            w.start()
+            _stream_workers[folder] = w
+
     return "done"
 
 
@@ -1268,9 +1385,6 @@ def plan_with_ai(files):
         team = select(ORCH_TYPES, "Which team do you want to set up?")
         if team is None:
             return None
-        if team == "__stream__":
-            run_stream_mode()
-            continue
         custom_desc = team if team not in TEAM_PROMPTS and team != CUSTOM_OPTION else ""
         result = run_team_conversation(team, synopsis, custom_description=custom_desc)
         if result is not None:
@@ -1278,86 +1392,8 @@ def plan_with_ai(files):
 
 
 # ---------------------------------------------------------------------------
-# Stream mode
+# MCP server registration (.mcp.json)
 # ---------------------------------------------------------------------------
-
-def _git_diff():
-    try:
-        r = subprocess.run(["git", "diff"], capture_output=True, text=True, cwd=os.getcwd())
-        return r.stdout.strip() or "(no unstaged changes)"
-    except Exception:
-        return "(git not available)"
-
-
-def _current_commit():
-    try:
-        r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-                           cwd=os.getcwd())
-        return r.stdout.strip() or None
-    except Exception:
-        return None
-
-
-def _stream_approval(thought, response):
-    """Three-option menu: Approve / Skip / Quit. Returns 'approve'|'skip'|'quit'."""
-    content_lines = [
-        "",
-        color(f"  Stream · {thought['id']}  (priority {thought['priority']})", BOLD, CYAN),
-        color("  " + "─" * 50, DIM, WHITE),
-        "",
-    ]
-    for line in response.splitlines():
-        content_lines.append(color("  " + line, WHITE))
-    content_lines.append("")
-    content = "\n".join(content_lines)
-
-    value, _ = menu(
-        [Option("approve", "Approve finding"),
-         Option("skip",    "Skip"),
-         Option("quit",    "Quit stream")],
-        title="What would you like to do with this finding?",
-        hint="(arrows · Enter to choose)",
-        render_top=lambda: print(content),
-    )
-    return value or "quit"
-
-
-def _valid_thought(q):
-    """A stream thought must have a non-empty id/prompt and an int priority."""
-    return (
-        isinstance(q, dict)
-        and isinstance(q.get("id"), str) and q["id"].strip()
-        and isinstance(q.get("prompt"), str) and q["prompt"].strip()
-        and isinstance(q.get("priority"), int) and not isinstance(q["priority"], bool)
-    )
-
-
-def _try_update_stream_thoughts(response, data):
-    """If Claude returned a valid revised thought list, write it back to wizard.yaml.
-
-    The whole list is rejected if any item is malformed, so a bad AI response
-    can never leave the persisted thoughts in a half-broken state.
-    """
-    m = re.search(r'```json\s*(\[.*?\])\s*```', response, re.DOTALL)
-    if not m:
-        return
-    try:
-        new_thoughts = json.loads(m.group(1))
-    except Exception:
-        return
-    if not (isinstance(new_thoughts, list) and new_thoughts):
-        return
-    if not all(_valid_thought(q) for q in new_thoughts):
-        return
-    cleaned = [
-        {"priority": q["priority"], "id": q["id"], "prompt": q["prompt"]}
-        for q in new_thoughts
-    ]
-    data.setdefault("stream", {}).pop("questions", None)
-    data.setdefault("stream", {})["thoughts"] = cleaned
-    save_wizard_yaml_data(data)
-    print(color("\n  Stream thoughts updated in wizard.yaml.\n", BOLD, GOLD))
-
 
 def _register_mcp_server(server_name, command):
     """Add an MCP server to the project's .mcp.json (merge, don't clobber)."""
@@ -1405,220 +1441,342 @@ def _unregister_mcp_servers(names):
     return True
 
 
-def _append_to_subagent(team_folder, agent_slug, note):
-    """Append an MCP-tool usage note to a subagent file. Returns True if updated."""
-    path = os.path.join(_agents_dir(), team_folder, agent_slug + ".md")
-    if not os.path.isfile(path):
-        return False
-    with open(path, "a") as f:
-        f.write(f"\n## MCP tools\n- {note}\n")
-    return True
+# ---------------------------------------------------------------------------
+# Background stream workers (per-orchestration daemon threads)
+# ---------------------------------------------------------------------------
+
+STREAM_TASKS = {
+    "dev": [
+        ("bug",      "Scan for bugs and logic errors"),
+        ("test",     "Identify missing test coverage"),
+        ("refactor", "Find refactoring and code quality opportunities"),
+        ("doc",      "Find missing or outdated documentation"),
+    ],
+}
 
 
-def _try_build_mcp_tool(answer, orch):
-    """Build an MCP tool the stream proposed and wire the subagents to it.
-
-    Expects generated ### FILE: blocks (the MCP server) plus a JSON object with
-    server_name, command (argv list), agents (subagent names to update), and an
-    optional tool_note. Writes the file(s), registers the server in .mcp.json,
-    appends the note to each named subagent, and records the artifacts in the
-    manifest so wipe cleans them up. No-ops on an incomplete proposal.
-    """
-    files = parse_generated_files(answer)
-    m     = re.search(r'```json\s*(\{.*?\})\s*```', answer, re.DOTALL)
-    if not files or not m:
-        return
+def _git_snapshot():
+    """Capture the working tree's change state for the cwd, or None if this isn't
+    a git repo (or git is unavailable). Returns ``(status_lines, fingerprint)``:
+    ``status_lines`` is the set of ``git status --porcelain`` lines (used to name
+    changed files), and ``fingerprint`` folds in several signals so any real edit
+    registers as a change:
+      - ``git diff`` — content of modified tracked files (incl. re-edits of an
+        already-dirty file, whose porcelain line alone wouldn't move);
+      - each untracked file's (path, mtime, size) — ``git diff`` never shows
+        untracked content, so editing an existing untracked file (common in a
+        fresh/uncommitted repo) would otherwise look like "no change".
+    ``-uall`` lists untracked files individually (not collapsed dirs) and
+    ``core.quotePath=false`` keeps non-ASCII paths usable for a later commit."""
+    import hashlib
     try:
-        spec = json.loads(m.group(1))
+        status = subprocess.run(
+            ["git", "-c", "core.quotePath=false", "status", "--porcelain", "-uall"],
+            capture_output=True, text=True, cwd=os.getcwd(), timeout=15,
+        )
+        if status.returncode != 0:
+            return None
+        diff = subprocess.run(
+            ["git", "diff"],
+            capture_output=True, text=True, cwd=os.getcwd(), timeout=15,
+        )
     except Exception:
-        return
-    server_name = spec.get("server_name")
-    command     = spec.get("command")
-    if not (server_name and isinstance(command, list) and command):
-        return
+        return None
+    lines = {ln for ln in status.stdout.splitlines() if ln.strip()}
+    h = hashlib.sha1()
+    h.update(status.stdout.encode("utf-8", "replace"))
+    h.update(b"\x00")
+    h.update(diff.stdout.encode("utf-8", "replace"))
+    for ln in sorted(lines):
+        if ln.startswith("??") and len(ln) > 3:
+            path = ln[3:]
+            try:
+                st = os.stat(os.path.join(os.getcwd(), path))
+                h.update(f"\x00{path}\x00{st.st_mtime_ns}\x00{st.st_size}".encode("utf-8", "replace"))
+            except OSError:
+                pass
+    return lines, h.hexdigest()
 
-    cwd, written = os.getcwd(), []
-    for rel_path, code in files:
-        full = os.path.join(cwd, rel_path)
-        if os.path.dirname(full):
-            os.makedirs(os.path.dirname(full), exist_ok=True)
-        with open(full, "w") as f:
-            f.write(code + "\n")
-        written.append(rel_path)
 
-    _register_mcp_server(server_name, command)
+def _git_commit(paths, message):
+    """Stage and commit exactly ``paths`` in the cwd; return the short commit hash
+    (or None). Best-effort — never raises, so a commit problem can't break task
+    completion. Skips when the index already has staged changes, so the user's
+    in-progress staging is never swept into the wizard's commit."""
+    try:
+        staged = subprocess.run(["git", "diff", "--cached", "--quiet"],
+                                capture_output=True, cwd=os.getcwd(), timeout=15)
+        if staged.returncode != 0:
+            return None  # something already staged — leave it for the user
+        add = subprocess.run(["git", "add", "--", *paths],
+                             capture_output=True, text=True, cwd=os.getcwd(), timeout=30)
+        if add.returncode != 0:
+            return None
+        commit = subprocess.run(["git", "commit", "-m", message],
+                                capture_output=True, text=True, cwd=os.getcwd(), timeout=30)
+        if commit.returncode != 0:
+            return None
+        rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, cwd=os.getcwd(), timeout=15)
+        return rev.stdout.strip() or None
+    except Exception:
+        return None
 
-    note        = spec.get("tool_note") or f"Use the {server_name} MCP tool."
-    team_folder = orch.get("team_folder", "")
-    updated = [a for a in spec.get("agents", [])
-               if _append_to_subagent(team_folder, _slug(a), note)]
 
-    # Record generated artifacts in the manifest so wipe removes them.
-    path = _manifest_path()
-    if os.path.isfile(path):
+# Only one agentic task edits the working tree at a time: concurrent edits — and
+# the repo-wide git verification (and commit) wrapped around them — would corrupt
+# each other.
+_task_exec_lock = threading.Lock()
+
+
+class StreamWorker(threading.Thread):
+    def __init__(self, orch, extra_tasks=None):
+        folder = orch.get("team_folder", "unknown")
+        super().__init__(daemon=True, name=f"stream-{folder}")
+        self.orch        = orch
+        self.orch_folder = folder
+        team_key         = next((k for k in STREAM_TASKS
+                                 if k in orch.get("team", "").lower()), "dev")
+        self._cycle = (list(STREAM_TASKS.get(team_key, STREAM_TASKS["dev"]))
+                       + list(extra_tasks or []))
+        self._idx   = 0
+        self._stop  = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+        self._log("worker stop requested")
+
+    def _log(self, msg):
+        _stream_log(f"[{self.orch_folder}] {msg}")
+
+    def run(self):
+        self._log(f"worker started (cycle of {len(self._cycle)} task type(s))")
+        while not self._stop.is_set():
+            try:
+                wizard_db.ensure_stream_config(self.orch_folder)
+                if not wizard_db.is_stream_enabled(self.orch_folder):
+                    time.sleep(2)
+                    continue
+                task = wizard_db.get_next_pending_task(self.orch_folder)
+                if task:
+                    self._log(f"picked queued task #{task['id']} "
+                              f"[{task['task_type']}] {task['description']}")
+                    self._execute(task["id"], task["description"], task["task_type"])
+                else:
+                    task_type, desc = self._cycle[self._idx % len(self._cycle)]
+                    self._idx += 1
+                    tid = wizard_db.add_task(self.orch_folder, desc, task_type)
+                    self._log(f"started cycle task #{tid} [{task_type}] {desc}")
+                    self._execute(tid, desc, task_type)
+                time.sleep(0.5)
+            except Exception as exc:
+                self._log(f"loop error: {exc!r} — backing off")
+                time.sleep(5)  # back off on DB errors, then retry
+        self._log("worker stopped")
+
+    def _execute(self, task_id, description, task_type):
+        wizard_db.set_task_running(task_id)
+        # A user-queued task is work for the team to do, not a code-review scan —
+        # actually carry it out, and only mark it done if files really changed.
+        if task_type == "user":
+            ok, summary = self._run_user_task(description)
+            if ok:
+                wizard_db.complete_task(task_id, summary)
+                self._log(f"completed user task #{task_id}: {summary[:120]}")
+            else:
+                wizard_db.fail_task(task_id, summary)
+                self._log(f"user task #{task_id} failed/no-op: {summary[:120]}")
+            return
         try:
-            with open(path) as f:
-                manifest = json.load(f)
-            manifest.setdefault("mcp_tools", []).extend(written)
-            manifest.setdefault("mcp_servers", []).append(server_name)
-            with open(path, "w") as f:
-                json.dump(manifest, f, indent=2)
+            findings = self._analyse(task_type)
+            for f in findings[:8]:
+                d = f.get("description", "")[:200]
+                if d:
+                    tid = wizard_db.add_task(self.orch_folder, d, task_type)
+                    wizard_db.complete_task(tid, "identified")  # log-only; don't re-execute
+                    self._log(f"  finding #{tid} [{task_type}] {d}")
+            summary = f"Found {len(findings)} item(s)" if findings else "Nothing to flag"
+            wizard_db.complete_task(task_id, summary)
+            self._log(f"completed task #{task_id} [{task_type}]: {summary}")
+        except Exception as exc:
+            wizard_db.complete_task(task_id, f"Error: {str(exc)[:80]}")
+            self._log(f"task #{task_id} [{task_type}] failed: {exc!r}")
+
+    def _run_user_task(self, description):
+        """Carry out a user-queued task as real work: run an edit-enabled Claude
+        in the project, verify (via git) that files actually changed, and commit
+        the task's own changes. Returns ``(ok: bool, summary: str)``.
+
+        Serialised on ``_task_exec_lock`` so two tasks can't edit the tree, read
+        each other's git diff, or race on a commit."""
+        prompt = (
+            "You are an autonomous coding agent working in this software project.\n\n"
+            f"Task: {description}\n\n"
+            "Carry out this task now by directly creating and editing files in the "
+            "project. Make the real changes — do not just describe a plan or ask "
+            "for confirmation. Keep the changes focused on the task. When finished, "
+            "reply with a one-line summary of what you changed."
+        )
+        with _task_exec_lock:
+            before = _git_snapshot()
+            try:
+                result = run_task(prompt, model=self.orch.get("model"), timeout=900)
+            except Exception as exc:
+                return False, f"Error: {str(exc)[:150]}"
+            after = _git_snapshot()
+
+            if before is None or after is None:
+                # Not a git repo (or git unavailable) — can't verify or commit.
+                return True, (result.strip()[:300] or "Completed (changes not verified)")
+            before_lines, before_fp = before
+            after_lines, after_fp = after
+            if after_fp == before_fp:
+                return False, ("Ran but made no file changes — "
+                               + (result.strip()[:160] or "no output"))
+            new = sorted(ln[3:].strip() for ln in (after_lines - before_lines) if len(ln) > 3)
+            if not new:
+                # Only already-dirty files changed further — leave committing to
+                # the user rather than risk bundling their in-progress edits.
+                return True, "Modified existing file(s) — left uncommitted."
+            auto = _auto_commit_enabled()
+            ref = (_git_commit(new, self._commit_message(description, result))
+                   if auto else None)
+
+        listed = ", ".join(new[:6])
+        if ref:
+            return True, f"Committed {ref} — {len(new)} file(s): {listed}"
+        if not auto:
+            return True, f"Changed {len(new)} file(s): {listed} (auto-commit off)"
+        return True, f"Changed {len(new)} file(s): {listed} (auto-commit skipped)"
+
+    def _commit_message(self, description, result=""):
+        """Build a commit message. The subject is the agent's own one-line summary
+        of what it changed — it already returns one (the task prompt asks for it),
+        so no extra AI call is needed. Falls back to the task description if the
+        summary is empty. The full task goes in the body for provenance."""
+        d = description.strip()
+        summary = next((ln.strip() for ln in (result or "").splitlines() if ln.strip()), "")
+        if not summary:
+            summary = (d.splitlines()[0] if d else "automated change")
+        subject = summary[:72]
+        return (f"{subject}\n\n"
+                f"Automated change by White Wizard ({self.orch.get('team', 'orchestration')}).\n"
+                f"Task: {d[:500]}")
+
+    def _analyse(self, task_type):
+        root       = os.getcwd()
+        code_files = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames
+                           if d not in IGNORE_DIRS and not d.startswith(".")]
+            for fname in filenames:
+                if os.path.splitext(fname)[1].lower() in CODE_EXTS:
+                    code_files.append(
+                        os.path.relpath(os.path.join(dirpath, fname), root))
+        if not code_files:
+            return []
+
+        snippets = []
+        for rel in code_files[:10]:
+            try:
+                with open(os.path.join(root, rel)) as fh:
+                    snippets.append(f"### {rel}\n{fh.read(3000)}")
+            except Exception:
+                pass
+
+        prompts_map = {
+            "bug":      "Identify bugs and logic errors",
+            "test":     "Identify missing test coverage",
+            "refactor": "Find refactoring opportunities",
+            "doc":      "Find missing or outdated documentation",
+        }
+        instruction = prompts_map.get(task_type, f"Analyze for: {task_type}")
+        prompt = (
+            f"You are a code review agent. Task: {instruction}.\n\n"
+            f"Files ({len(code_files)} total, showing {len(snippets)}):\n\n"
+            + "\n\n---\n\n".join(snippets)
+            + "\n\nReturn ONLY a JSON array of specific findings:\n"
+              '[{"description":"short issue (max 200 chars)","task_type":"'
+              + task_type + '"}]\n'
+              "Return [] if nothing notable. No prose."
+        )
+        try:
+            raw = ask(prompt, timeout=90)
+            m = re.search(r'\[.*\]', raw, re.DOTALL)
+            if m:
+                found = json.loads(m.group(0))
+                if isinstance(found, list):
+                    return found
         except Exception:
             pass
-
-    print(color(f"\n  Built MCP tool '{server_name}' ({len(written)} file(s)); "
-                f"updated {len(updated)} subagent(s).\n", BOLD, GOLD))
+        return []
 
 
-def _build_thought_prompt(template, q, git_diff, orch_plan, last_commit, current_commit):
-    return (template
-            .replace("{thought_prompt}", q.get("prompt", ""))
-            .replace("{git_diff}", git_diff[:4000])
-            .replace("{orch_plan}", orch_plan[:2000])
-            .replace("{last_commit}", last_commit or "none")
-            .replace("{current_commit}", current_commit or "unknown"))
+_stream_workers: dict = {}
 
 
-def _wizard_route(answer, current_q, remaining):
-    """ROUTE state: the White Wizard reads an agent's answer and decides
-    (a) whether it is an actionable finding worth surfacing to the user, and
-    (b) which remaining thought to visit next ('done' to finish).
-
-    Returns (actionable: bool, next_id: str). Defaults to surfacing the finding
-    when the wizard's reply can't be parsed, so nothing is silently hidden.
-    """
-    default_next = remaining[0]["id"] if remaining else "done"
-    menu = "\n".join(f'  - {q["id"]}: {q.get("prompt", "")}' for q in remaining) or "  (none)"
-    prompt = (
-        "You are the White Wizard, the router in a two-state stream-mode state "
-        "machine. An agent has just answered a review thought. Do two things:\n"
-        "1. Decide whether the answer is an ACTIONABLE finding (a real issue, a "
-        "needed change, or a concrete recommendation) or a NO-OP (no issues, "
-        "nothing to do).\n"
-        "2. Choose which remaining thought to visit next, or finish.\n\n"
-        f"Thought answered ({current_q.get('id')}): {current_q.get('prompt', '')}\n\n"
-        f"Agent's answer:\n{answer}\n\n"
-        f"Remaining thoughts:\n{menu}\n\n"
-        "Reply with ONLY a JSON object, no prose:\n"
-        '{"actionable": true or false, "next": "<thought id, or done>"}'
-    )
-    decision = conjure(ask, prompt, label="Wizard routing...", model=DEFAULT_MODEL)
-
-    actionable, nxt = True, default_next
-    m = re.search(r"\{.*\}", decision, re.DOTALL)
-    if m:
-        try:
-            obj = json.loads(m.group(0))
-            actionable = bool(obj.get("actionable", True))
-            nxt = re.sub(r"[^a-z0-9_]", "", str(obj.get("next", default_next)).lower()) or "done"
-        except Exception:
-            pass
-    return actionable, nxt
+def _start_stream_workers():
+    """Start a StreamWorker daemon thread for every existing orchestration."""
+    for orch in list_orchestrations():
+        folder = orch.get("team_folder")
+        if folder and folder not in _stream_workers:
+            w = StreamWorker(orch)
+            w.start()
+            _stream_workers[folder] = w
 
 
-def _load_stream_thoughts(data):
-    """Read stream thoughts from wizard.yaml, accepting the legacy 'questions' key.
-
-    wizard.yaml is hand-editable, so tolerate a malformed ``stream`` section
-    (non-dict, or a non-list thoughts value) by falling back to the defaults
-    instead of crashing.
-    """
-    stream = data.get("stream") if isinstance(data, dict) else None
-    if not isinstance(stream, dict):
-        stream = {}
-    raw = stream.get("thoughts")
-    if raw is None:
-        raw = stream.get("questions", DEFAULT_STREAM_THOUGHTS)
-    if not isinstance(raw, list):
-        raw = DEFAULT_STREAM_THOUGHTS
-    thoughts = [q for q in raw if _valid_thought(q)]
-    return thoughts or list(DEFAULT_STREAM_THOUGHTS)
+def _stop_stream_worker(folder):
+    """Signal and remove the worker for a wiped orchestration."""
+    w = _stream_workers.pop(folder, None)
+    if w:
+        w.stop()
 
 
-def run_stream_mode():
-    """Run stream mode as a two-state machine: an agent ANSWERs the current
-    thought, then the White Wizard ROUTEs to the next thought (or finishes)."""
-    clear()
-    show_header()
+def _run_task_once(orch, task):
+    """Run a single task in a one-shot background thread, regardless of whether
+    the stream is enabled — lets the user run a hand-picked task while paused.
 
-    yaml_path = find_wizard_yaml()
-    if not yaml_path:
-        print(color("  No wizard.yaml found.\n", BOLD, GOLD))
-        print(color("  Run `wizard` first to set up an orchestration.\n", DIM, WHITE))
-        return
+    Reuses StreamWorker._execute, which marks the task running, does the work,
+    and completes it. set_task_running flips the status immediately, so an
+    enabled worker won't also pick it up (it only takes 'pending' tasks)."""
+    worker = StreamWorker(orch)
+    threading.Thread(
+        target=lambda: worker._execute(
+            task["id"], task["description"], task["task_type"]),
+        daemon=True,
+    ).start()
 
-    data     = load_wizard_yaml()
-    thoughts = _load_stream_thoughts(data)
-    thoughts.sort(key=lambda q: q["priority"])
-    by_id     = {q["id"]: q for q in thoughts}
-    orch_plan = json.dumps(load_orchestration() or {}, indent=2)
 
-    git_diff      = _git_diff()
-    current_commit = _current_commit()
-    last_commit    = wizard_db.get_last_scanned_commit()
+def _shutdown_stream_workers():
+    """Gracefully stop every background stream worker and kill any in-flight AI
+    call. Workers are daemon threads (they die on process exit regardless); this
+    signals them to stop looping and releases the current `claude` subprocess so
+    quitting — or a Ctrl+C — doesn't leave work running."""
+    if _stream_workers:
+        _stream_log(f"shutting down {len(_stream_workers)} worker(s)")
+    for w in list(_stream_workers.values()):
+        w.stop()
+    _stream_workers.clear()
+    kill_current()
 
-    stats = wizard_db.get_stream_stats()
-    print(color("  Stream mode\n", BOLD, CYAN))
-    print(color(f"  Thoughts  : {len(thoughts)}", WHITE))
-    print(color(f"  Last run  : {stats['last_run_at'] or 'never'}", WHITE))
-    print(color(f"  Last commit scanned: {stats['last_commit'] or 'none'}\n", WHITE))
-    time.sleep(1.2)
 
-    run_id   = wizard_db.start_stream_run(current_commit, git_diff)
-    template = load_prompt("stream_thought.md")
-
-    current = thoughts[0]
-    visited = set()
-
-    while current and current["id"] not in visited:
-        # STATE 1 — ANSWER: an agent answers the current thought.
-        prompt = _build_thought_prompt(template, current, git_diff, orch_plan,
-                                       last_commit, current_commit)
-        answer = conjure(ask, prompt,
-                         label=f"Stream [{current['id']}]...", model=DEFAULT_MODEL)
-
-        # STATE 2 — ROUTE: the White Wizard judges the answer and picks next.
-        remaining = [q for q in thoughts
-                     if q["id"] not in visited and q["id"] != current["id"]]
-        actionable, nxt = _wizard_route(answer, current, remaining)
-
-        if actionable:
-            action = _stream_approval(current, answer)
-            if action == "approve":
-                wizard_db.save_finding(run_id, current["id"], current["priority"], answer, approved=True)
-                if current["id"] == "stream_self_improve":
-                    _try_update_stream_thoughts(answer, data)
-                elif current["id"] == "mcp_optimization":
-                    _try_build_mcp_tool(answer, load_orchestration() or {})
-            elif action == "skip":
-                wizard_db.save_finding(run_id, current["id"], current["priority"], answer, approved=False)
-            elif action == "quit":
-                wizard_db.finish_stream_run(run_id, current_commit)
-                print(color("\n  Stream stopped.\n", DIM, WHITE))
+def _ensure_wizard_gitignore():
+    """Add .wizard/ to .gitignore if not already present."""
+    gitignore = os.path.join(os.getcwd(), ".gitignore")
+    entry     = ".wizard/"
+    try:
+        if os.path.isfile(gitignore):
+            with open(gitignore) as f:
+                content = f.read()
+            if entry in content:
                 return
+            with open(gitignore, "a") as f:
+                f.write(f"\n{entry}\n")
         else:
-            # NO-OP: the wizard auto-dismisses the finding without prompting.
-            wizard_db.save_finding(run_id, current["id"], current["priority"], answer, approved=False)
-            clear()
-            show_header()
-            print(color(f"  Stream · {current['id']}  (priority {current['priority']})", BOLD, CYAN))
-            print(color("  " + "─" * 50, DIM, WHITE))
-            print(color(f"\n  {answer}\n", DIM, WHITE))
-            print(color("  (no action needed — continuing)\n", GRAY))
-            time.sleep(1.5)
-
-        visited.add(current["id"])
-
-        if nxt == "done" or not remaining:
-            break
-        candidate = by_id.get(nxt)
-        current   = candidate if (candidate and nxt not in visited) else remaining[0]
-
-    wizard_db.finish_stream_run(run_id, current_commit)
-    clear()
-    show_header()
-    print(color("  Stream complete.\n", BOLD, GOLD))
-    print(color(f"  {len(visited)} thought(s) processed.\n", DIM, WHITE))
+            with open(gitignore, "w") as f:
+                f.write(f"{entry}\n")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1636,9 +1794,6 @@ def _first_menu():
         choice = select(OPTIONS, "What shall we summon today?")
         if choice is None:
             return None
-        if choice == "__stream__":
-            run_stream_mode()
-            continue
         if choice not in OPTIONS:
             # Free-form "Something else" query — answer and keep browsing.
             _ask_and_show(choice)
@@ -1657,6 +1812,16 @@ def main():
     # Two main menus: the existing-orchestrations menu when one or more have been
     # built (switch/task/wipe), else the build menu. Looping between them means a
     # wipe or a build lands back on the right menu instead of exiting.
+    # wizard.yaml presence is intentionally excluded: it's preserved after wipe
+    # (holds stream thoughts/settings), so it can't drive the routing decision.
+    _ensure_wizard_gitignore()
+    # Sweep operational state left behind by orchestrations wiped in older
+    # sessions (before wipe cleaned the DB), so they don't linger or resurface.
+    pruned = wizard_db.prune_orphaned_state(
+        {o.get("team_folder") for o in list_orchestrations() if o.get("team_folder")})
+    if pruned:
+        _stream_log(f"pruned {pruned} orphaned task(s) from removed orchestration(s)")
+    _start_stream_workers()
     while True:
         if load_orchestration():
             if handle_wizard_yaml() == "__refresh__":
@@ -1667,4 +1832,5 @@ def main():
                 break               # user quit the build menu
             # built something → loop → existing-orchestrations menu
 
+    _shutdown_stream_workers()
     print(color("\n  The staff dims. Farewell.\n", DIM, WHITE))
