@@ -78,9 +78,21 @@ class OrchestrationLifecycleTest(unittest.TestCase):
         os.chdir(self.repo)
 
         self.menu = ScriptedMenu()
+
+        # The main menu is now a curses split pane. Stand in for it: quit
+        # immediately unless a wipe was requested, in which case drive the
+        # "wipe" choice (which itself falls back to the patched menu to confirm).
+        def fake_pane(get_state_fn, get_options_fn, handle_choice_fn,
+                      handle_task_fn=None, _m=self.menu):
+            if not _m.wipe:
+                return None
+            return handle_choice_fn("wipe", "", get_state_fn(0))
+
         self._patches = [
             mock.patch.dict(os.environ, {"WHITE_WIZARD_MOCK_REPLY": CANNED_PLAN}),
             mock.patch.object(app, "menu", self.menu),
+            mock.patch.object(app, "select_menu", self.menu),
+            mock.patch.object(app, "run_split_pane", fake_pane),
             mock.patch.object(app, "read_key", lambda: "enter"),
             mock.patch.object(app, "loading", lambda *a, **k: None),
             mock.patch.object(app, "_ensure_mcp", lambda *a, **k: ("ok", "")),

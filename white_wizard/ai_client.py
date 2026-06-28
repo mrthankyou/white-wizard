@@ -13,18 +13,21 @@ Backends:
 The backend is chosen by passing --mock or --claude when running wizard.
 """
 import logging
+import logging.handlers
 import os
 import shutil
 import subprocess
 import sys
+import threading
 
 DEFAULT_BACKEND = "mock"
 BACKENDS = ("mock", "claude")
 
 _backend = DEFAULT_BACKEND
-_current_proc = None  # live claude subprocess, if any
-_logger = None        # debug logger when --debug is on, else None
-_log_path = None      # path to the active debug log, for display
+_current_procs = set()       # live claude subprocesses (may be >1 with concurrent workers)
+_procs_lock = threading.Lock()
+_logger = None        # AI request/response logger, set by enable_debug_logging
+_log_path = None      # path to the active debug log
 _seq = 0              # request counter, to pair prompts with responses
 
 
@@ -33,7 +36,8 @@ def enable_debug_logging():
 
     Every prompt sent to the backend and every response (or error) is appended,
     so a failed run can be inspected after the fact. The log lives in .wizard/
-    (gitignored) and is reused across runs.
+    (gitignored) and is reused across runs. It runs always-on (enabled at
+    startup), so the handler rotates at 5 MB (3 backups kept) to stay bounded.
     """
     global _logger, _log_path
     wizard_dir = os.path.join(os.getcwd(), ".wizard")
@@ -43,17 +47,14 @@ def enable_debug_logging():
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
     if not logger.handlers:
-        handler = logging.FileHandler(_log_path, encoding="utf-8")
+        handler = logging.handlers.RotatingFileHandler(
+            _log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
         logger.addHandler(handler)
     _logger = logger
     logger.info("=== debug logging enabled (backend=%s) ===", _backend)
     return _log_path
 
-
-def debug_log_path():
-    """Path of the active debug log, or None if --debug was not passed."""
-    return _log_path
 
 HELP = """\
 White Wizard - conjure multi-agent orchestration systems with a single button.
@@ -65,24 +66,23 @@ Usage:
 Options:
   --mock      Use the offline mock AI backend (default).
   --claude    Use the Claude CLI backend (`claude -p`).
-  --stream    Run stream mode: execute the prioritized review checklist
-              against the current codebase (requires wizard.yaml).
-  --debug     Log every AI prompt and response to .wizard/debug.log.
   --help      Show this help message and exit.
+
+Logging (always on, gitignored, size-rotated):
+  .wizard/debug.log    every AI prompt and response
+  .wizard/stream.log   task queue / stream-worker activity
 
 Examples:
   wizard                   # run with mock AI (default)
   wizard --claude          # use real Claude CLI
-  wizard --claude --stream # stream mode with real Claude
-  wizard --claude --debug  # trace AI prompts/responses to .wizard/debug.log
 """
 
 
 def parse_args(argv=None):
     """Strip known flags from argv and configure the module backend.
 
-    Returns a dict with keys: stream (bool), debug (bool).
-    Prints help and exits on --help.
+    Prints help and exits on --help. AI request/response logging is always on
+    (the caller enables it at startup), so there is no flag to parse for it.
     """
     global _backend
     argv = list(argv if argv is not None else sys.argv[1:])
@@ -95,17 +95,9 @@ def parse_args(argv=None):
     elif "--mock" in argv:
         _backend = "mock"
         argv.remove("--mock")
-    stream = "--stream" in argv
-    if stream:
-        argv.remove("--stream")
-    debug = "--debug" in argv
-    if debug:
-        argv.remove("--debug")
-        enable_debug_logging()
     if argv:  # anything left is unrecognized
         print(f"Warning: ignoring unrecognized option(s): {' '.join(argv)}",
               file=sys.stderr)
-    return {"stream": stream, "debug": debug}
 
 
 def ask_messages(messages, *, model=None, backend=None, timeout=120):
@@ -172,6 +164,31 @@ def ask_with_history(history, new_message, *, model=None, backend=None, timeout=
     return ask_messages(messages, model=model, backend=backend, timeout=timeout)
 
 
+# Tools granted to the agentic task runner. Deliberately excludes Bash so the
+# wizard edits files but doesn't run arbitrary shell commands on its own.
+_TASK_TOOLS = ["Read", "Edit", "Write", "Grep", "Glob"]
+
+
+def run_task(prompt, *, model=None, timeout=900):
+    """Run an edit-enabled ``claude -p`` that actually performs work in the
+    current directory — creating and editing files — rather than just answering.
+    Returns the final text. The mock backend returns a canned string and makes
+    no changes (so offline/test runs never touch the filesystem)."""
+    resolved = _backend
+    messages = [{"role": "user", "content": prompt}]
+    req_id = _log_request(resolved, model, messages)
+    try:
+        if resolved == "mock":
+            response = _mock(messages, model=model)
+        else:
+            response = _claude_agentic(prompt, model=model, timeout=timeout)
+    except Exception as exc:
+        _log_error(req_id, exc)
+        raise
+    _log_response(req_id, response)
+    return response
+
+
 # A valid agent plan the mock returns when a plan is requested, so running the
 # wizard against the mock backend actually builds an orchestration (files on
 # disk) instead of dead-ending. The planner prompt embeds a ``` fence on purpose
@@ -217,11 +234,25 @@ def _mock(messages, *, model=None):
 
 
 def kill_current():
-    """Kill the in-flight claude subprocess, if any. Safe to call from any thread."""
-    global _current_proc
-    proc = _current_proc
-    if proc and proc.poll() is None:
-        proc.kill()
+    """Kill any in-flight claude subprocess(es). Safe to call from any thread."""
+    with _procs_lock:
+        procs = list(_current_procs)
+    for proc in procs:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+
+
+def _track_proc(proc):
+    with _procs_lock:
+        _current_procs.add(proc)
+
+
+def _untrack_proc(proc):
+    with _procs_lock:
+        _current_procs.discard(proc)
 
 
 def _flatten(messages):
@@ -241,7 +272,6 @@ def _flatten(messages):
 
 
 def _claude(messages, *, model=None, timeout=120):
-    global _current_proc
     if shutil.which("claude") is None:
         raise RuntimeError(
             "`claude` CLI not found on PATH. "
@@ -251,7 +281,7 @@ def _claude(messages, *, model=None, timeout=120):
     if model:
         cmd += ["--model", model]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    _current_proc = proc
+    _track_proc(proc)
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -259,7 +289,36 @@ def _claude(messages, *, model=None, timeout=120):
         proc.communicate()
         raise RuntimeError(f"claude timed out after {timeout}s")
     finally:
-        _current_proc = None
+        _untrack_proc(proc)
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude exited {proc.returncode}: {stderr.strip()}")
+    return stdout.strip()
+
+
+def _claude_agentic(prompt, *, model=None, timeout=900):
+    """Like ``_claude``, but grants file-editing tools and a non-interactive
+    permission mode (``acceptEdits``) so the model carries out the task and
+    writes the changes instead of describing them."""
+    if shutil.which("claude") is None:
+        raise RuntimeError(
+            "`claude` CLI not found on PATH. "
+            "Install it or run without --claude to use the mock."
+        )
+    cmd = ["claude", "-p", prompt,
+           "--permission-mode", "acceptEdits",
+           "--allowedTools", *_TASK_TOOLS]
+    if model:
+        cmd += ["--model", model]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    _track_proc(proc)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise RuntimeError(f"claude timed out after {timeout}s")
+    finally:
+        _untrack_proc(proc)
     if proc.returncode != 0:
         raise RuntimeError(f"claude exited {proc.returncode}: {stderr.strip()}")
     return stdout.strip()

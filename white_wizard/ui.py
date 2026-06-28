@@ -25,16 +25,14 @@ BRIGHT_BLUE = "\033[94m"
 DANGER      = "\033[38;5;208m"
 
 WIZARD = r"""
-                /\
-               /  \
-              / ** \
-             /  *   \
-            /   **   \
-           /  *    *  \
-          /     **    \
-         /____________ \
-    ____/______________\____
-   (________________________)
+             /\
+            /  \
+           / ** \
+          /  *   \
+         /   **   \
+        /____________\
+   ____/______________\____
+  (________________________)
 """
 
 
@@ -77,6 +75,11 @@ def show_header():
     print(color("              The White Wizard", BOLD, GOLD))
     print(color("   Conjure multi-agent orchestration with a single button.", DIM, WHITE))
     print()
+
+
+def show_header_compact():
+    """Hat only — no title/subtitle. Used in build and result screens."""
+    print(color(WIZARD, BOLD, WHITE))
 
 
 def read_key():
@@ -238,3 +241,810 @@ def menu(options, title="", hint="", render_top=None, footer=None, extra_keys=No
                 texts[selected] = texts.get(selected, "")[:-1]
             elif len(key) == 1 and key.isprintable():
                 texts[selected] = texts.get(selected, "") + key
+
+
+# ---------------------------------------------------------------------------
+# Curses split-pane live UI
+# ---------------------------------------------------------------------------
+
+import time as _time
+
+_CP_GOLD   = 1
+_CP_CYAN   = 2
+_CP_GREEN  = 3
+_CP_DIM    = 4
+_CP_SELECT = 5
+_CP_WHITE  = 6
+_CP_BLUE   = 7
+_CP_RED    = 8
+
+# Three "magic diamond" flame shown beside each running task — the same blue→
+# white shimmer as the loading spinner, rebuilt for curses (the SPINNER_FRAMES
+# strings embed ANSI codes curses can't render). Each diamond is phase-shifted
+# so the three flicker out of step; the frame is chosen by wall-clock time, so
+# it animates as the split pane redraws.
+_FLAME_GLYPH  = ("◇", "◇", "◈", "◆", "◆")   # cool/dim → hot/bright
+_FLAME_SPAN   = len(_FLAME_GLYPH)
+_FLAME_PERIOD = 2 * (_FLAME_SPAN - 1)        # triangle wave: cool → hot → cool
+
+
+def _flame_attr(level):
+    import curses
+    ramp = (
+        curses.color_pair(_CP_BLUE),                    # blue
+        curses.color_pair(_CP_BLUE)  | curses.A_BOLD,   # bright blue
+        curses.color_pair(_CP_CYAN),                    # cyan
+        curses.color_pair(_CP_GOLD),                    # gold
+        curses.color_pair(_CP_WHITE) | curses.A_BOLD,   # white
+    )
+    return ramp[level]
+
+
+def _sp_draw_flame(win, y, x):
+    """Draw the animated three-diamond magic flame at columns x..x+2."""
+    t = int(_time.time() * 8)
+    for pos in range(3):
+        phase = (t + pos * 3) % _FLAME_PERIOD
+        level = phase if phase < _FLAME_SPAN else _FLAME_PERIOD - phase
+        _sp_addstr(win, y, x + pos, _FLAME_GLYPH[level], _flame_attr(level))
+
+
+def _sp_draw_shimmer(win, y, x, text):
+    """Draw text with an animated per-character colour wave (the flame palette),
+    so the word itself flickers blue→white as the pane redraws."""
+    import curses
+    t = int(_time.time() * 8)
+    for i, ch in enumerate(text):
+        phase = (t + i) % _FLAME_PERIOD
+        level = phase if phase < _FLAME_SPAN else _FLAME_PERIOD - phase
+        _sp_addstr(win, y, x + i, ch, _flame_attr(level) | curses.A_BOLD)
+
+
+# Gently rotating progress phrases for the running-task bar — cosmetic liveness
+# (the flame + elapsed timer carry the real signal). Cycled by wall-clock time.
+_STATUS_PHRASES = (
+    "Conjuring results…",
+    "Weaving it together…",
+    "Working the magic…",
+)
+
+
+def _elapsed_str(updated_at):
+    """Human elapsed time since a SQLite UTC 'updated_at' timestamp ('' if bad)."""
+    import datetime
+    try:
+        started = datetime.datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
+        started = started.replace(tzinfo=datetime.timezone.utc)
+    except (ValueError, TypeError):
+        return ""
+    secs = max(0, int((datetime.datetime.now(datetime.timezone.utc) - started)
+                      .total_seconds()))
+    if secs < 60:
+        return f"{secs}s"
+    m, s = divmod(secs, 60)
+    return f"{m}m {s}s"
+
+
+def _wrap_hard(text, width):
+    """Wrap text to width, hard-splitting tokens longer than width so nothing is
+    clipped. Returns a list of lines."""
+    width = max(1, width)
+    words = []
+    for w in text.split():
+        while len(w) > width:
+            words.append(w[:width]); w = w[width:]
+        words.append(w)
+    lines, line = [], ""
+    for word in words:
+        if line and len(line) + 1 + len(word) > width:
+            lines.append(line); line = word
+        else:
+            line = (line + " " + word).strip()
+    if line:
+        lines.append(line)
+    return lines
+
+
+def _wrap_chars(text, width):
+    """Char-level wrap into fixed-width visual lines, giving an exact
+    index↔(line, col) mapping (line = i // width, col = i % width) for cursor
+    math. A trailing empty line is added when the text is empty or ends exactly
+    on a line boundary, so the cursor always has a cell at the end."""
+    width = max(1, width)
+    lines = [text[k:k + width] for k in range(0, len(text), width)]
+    if not lines or len(text) % width == 0:
+        lines.append("")
+    return lines
+
+
+# Shared multi-line text-field editor — used by the main split pane and the
+# build/selection menu so the prompt experience (soft-wrap, blinking block
+# caret, gray placeholder, cursor nav) is identical everywhere.
+
+def _te_render(win, y, x, field_w, display, attr, caret):
+    """Draw ``display`` soft-wrapped from (y, x) within ``field_w`` columns, with
+    an optional reverse-video block caret at index ``caret`` (None = no caret).
+    Returns the number of rows drawn."""
+    import curses
+    lines = _wrap_chars(display, field_w)
+    for li, ln in enumerate(lines):
+        _sp_addstr(win, y + li, x, ln, attr)
+    if caret is not None:
+        c_line, c_col = caret // field_w, caret % field_w
+        if 0 <= c_line < len(lines):
+            ln = lines[c_line]
+            cell = ln[c_col] if c_col < len(ln) else " "
+            _sp_addstr(win, y + c_line, x + c_col, cell or " ",
+                       curses.color_pair(_CP_WHITE) | curses.A_REVERSE | curses.A_BOLD)
+    return len(lines)
+
+
+def _te_edit(ed, key, field_w):
+    """Apply an editing keypress to ``ed`` = {"text", "cursor", "goal_col"} in
+    place. Returns:
+      "edit"                       — consumed as text editing or a cursor move;
+      "top"/"bottom"/"left"/"right" — the cursor is already at that edge, so the
+                                      caller decides what crossing it means;
+      None                          — ``key`` isn't an editing key at all.
+    """
+    import curses
+    text, cur = ed["text"], ed["cursor"]
+    if key == curses.KEY_LEFT:
+        if cur > 0:
+            ed["cursor"] = cur - 1; ed["goal_col"] = ed["cursor"] % field_w
+            return "edit"
+        return "left"
+    if key == curses.KEY_RIGHT:
+        if cur < len(text):
+            ed["cursor"] = cur + 1; ed["goal_col"] = ed["cursor"] % field_w
+            return "edit"
+        return "right"
+    if key == curses.KEY_UP:
+        lines, c_line = _wrap_chars(text, field_w), cur // field_w
+        if c_line > 0:
+            prev = lines[c_line - 1]
+            ed["cursor"] = min((c_line - 1) * field_w + min(ed["goal_col"], len(prev)), len(text))
+            return "edit"
+        return "top"
+    if key == curses.KEY_DOWN:
+        lines, c_line = _wrap_chars(text, field_w), cur // field_w
+        if c_line < len(lines) - 1:
+            nxt = lines[c_line + 1]
+            ed["cursor"] = min((c_line + 1) * field_w + min(ed["goal_col"], len(nxt)), len(text))
+            return "edit"
+        return "bottom"
+    if key in (curses.KEY_BACKSPACE, 127, 8):
+        if cur > 0:
+            ed["text"] = text[:cur - 1] + text[cur:]
+            ed["cursor"] = cur - 1; ed["goal_col"] = ed["cursor"] % field_w
+        return "edit"
+    if 32 <= key < 127:
+        ed["text"] = text[:cur] + chr(key) + text[cur:]
+        ed["cursor"] = cur + 1; ed["goal_col"] = ed["cursor"] % field_w
+        return "edit"
+    return None
+
+
+WIZARD_COMPACT = [
+    "       /\\",
+    "      /  \\",
+    "     / ** \\",
+    "    /______\\",
+    "___/________\\___",
+    "(_______________)",
+]
+
+
+def _sp_setup_colors():
+    import curses
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(_CP_GOLD,   curses.COLOR_YELLOW, -1)
+    curses.init_pair(_CP_CYAN,   curses.COLOR_CYAN,   -1)
+    curses.init_pair(_CP_GREEN,  curses.COLOR_GREEN,  -1)
+    curses.init_pair(_CP_DIM,    -1, -1)
+    curses.init_pair(_CP_SELECT, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+    curses.init_pair(_CP_WHITE,  curses.COLOR_WHITE,  -1)
+    curses.init_pair(_CP_BLUE,   curses.COLOR_BLUE,   -1)
+    curses.init_pair(_CP_RED,    curses.COLOR_RED,    -1)
+
+
+def _sp_addstr(win, y, x, text, attr=0):
+    """curses addstr that silently clips and ignores out-of-bounds."""
+    import curses
+    try:
+        h, w = win.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return
+        avail = w - x - 1
+        if avail <= 0:
+            return
+        win.addstr(y, x, text[:avail], attr)
+    except curses.error:
+        pass
+
+
+def _sp_draw_left(win, state):
+    import curses
+    win.erase()
+    h, left_w = win.getmaxyx()
+    y = 0
+
+    # Wizard hat
+    hat_attr = curses.color_pair(_CP_WHITE) | curses.A_BOLD
+    for line in WIZARD_COMPACT:
+        _sp_addstr(win, y, 1, line, hat_attr)
+        y += 1
+    y += 1
+
+    # Alerts (shown once — caller clears after providing)
+    for alert in state.get("alerts", []):
+        _sp_addstr(win, y, 1, f"✓ {alert}"[:left_w - 2],
+                   curses.color_pair(_CP_GOLD) | curses.A_BOLD)
+        y += 1
+    if state.get("alerts"):
+        y += 1
+
+    # Orch info
+    orch = state.get("current_orch")
+    orchs = state.get("orchs", [])
+    if orch:
+        team = orch.get("team", "Orchestration")
+        pos = f" [{state.get('sel_orch_i', 0) + 1}/{len(orchs)}]" if len(orchs) > 1 else ""
+        _sp_addstr(win, y, 1, f"{team}{pos}"[:left_w - 2],
+                   curses.color_pair(_CP_GOLD) | curses.A_BOLD)
+        y += 1
+        if state.get("mode") == "manage":
+            _sp_addstr(win, y, 1, "› Manage",
+                       curses.color_pair(_CP_DIM) | curses.A_DIM)
+            y += 1
+        orch_name = orch.get("orchestrator", "")
+        _sp_addstr(win, y, 1, f"orch: {orch_name}"[:left_w - 2],
+                   curses.color_pair(_CP_DIM) | curses.A_DIM)
+        y += 1
+        for n, name in enumerate(state.get("agent_names", [])[:6], 1):
+            _sp_addstr(win, y, 2, f"{n}. {name}"[:left_w - 3],
+                       curses.color_pair(_CP_WHITE))
+            y += 1
+        y += 1
+
+    # Options
+    opts   = state.get("opts", [])
+    opt_i  = state.get("opt_i", 0)
+    text   = state.get("text", "")
+    cursor = state.get("cursor", 0)
+    focus  = state.get("focus", "left")
+
+    for i, opt in enumerate(opts):
+        if y >= h - 1:
+            break
+        selected = (i == opt_i)
+        if opt.disabled:
+            _sp_addstr(win, y, 1, f"  {opt.label}  (coming soon)"[:left_w - 2],
+                       curses.color_pair(_CP_DIM) | curses.A_DIM)
+        elif selected and opt.text_input:
+            # Multi-line editable field: soft-wrap the text so all of it shows,
+            # with a blinking block caret at the cursor. The first line carries
+            # the "> " prompt; wrapped lines align under it.
+            _sp_addstr(win, y, 1, "> ", curses.color_pair(_CP_GOLD) | curses.A_BOLD)
+            field_w = max(1, left_w - 4)
+            if text:
+                display, base_attr, cur = text, curses.color_pair(_CP_WHITE), cursor
+            else:
+                # Grayed placeholder reads as a hint, not a value — signals the
+                # field is empty and typable.
+                display = opt.placeholder or opt.label
+                base_attr, cur = curses.color_pair(_CP_DIM) | curses.A_DIM, 0
+            # Block caret only while the left pane has focus (that's where typing
+            # lands) and on the blink-on half-second.
+            caret = cur if (focus == "left" and int(_time.time() * 2) % 2 == 0) else None
+            y += _te_render(win, y, 3, field_w, display, base_attr, caret) - 1
+            # (trailing y += 1 below adds the first line)
+        elif selected:
+            # Bright highlight only while the left pane has focus; a calmer gold
+            # when focus is on the task pane, so it's clear where input goes.
+            attr = (curses.color_pair(_CP_SELECT) | curses.A_BOLD
+                    if state.get("focus", "left") == "left"
+                    else curses.color_pair(_CP_GOLD) | curses.A_BOLD)
+            _sp_addstr(win, y, 1, f"> {opt.label}"[:left_w - 2], attr)
+        else:
+            # A text-input option with a kept draft shows that draft (collapsed
+            # to its row) instead of its label/placeholder, so typed text isn't
+            # hidden once the option is no longer selected.
+            saved = state.get("texts", {}).get(opt.value, "") if opt.text_input else ""
+            _sp_addstr(win, y, 3, (saved or opt.label)[:left_w - 4],
+                       curses.color_pair(_CP_WHITE))
+        y += 1
+
+    win.noutrefresh()
+
+
+def _sp_draw_right(win, state):
+    import curses
+    win.erase()
+    h, right_w = win.getmaxyx()
+
+    orch = state.get("current_orch")
+    if not orch:
+        _sp_addstr(win, h // 2, 2, "No orchestration yet.",
+                   curses.color_pair(_CP_DIM) | curses.A_DIM)
+        win.noutrefresh()
+        return
+
+    stream_enabled = state.get("stream_enabled", True)
+    focus_right    = state.get("focus", "left") == "right"
+    tasks          = state.get("tasks", [])
+    task_i         = state.get("task_i", 0)
+    team           = orch.get("team", "Orchestration")
+
+    # Header
+    y = 0
+    _sp_addstr(win, y, 2, team[:right_w // 2],
+               curses.color_pair(_CP_GOLD) | curses.A_BOLD)
+    status_str  = "● streaming" if stream_enabled else "‖ paused"
+    status_attr = (curses.color_pair(_CP_GREEN) if stream_enabled
+                   else curses.color_pair(_CP_GOLD) | curses.A_BOLD)
+    _sp_addstr(win, y, max(2, right_w - len(status_str) - 2), status_str, status_attr)
+    y += 1
+    _sp_addstr(win, y, 2, "─" * max(0, right_w - 4),
+               curses.color_pair(_CP_DIM) | curses.A_DIM)
+    y += 2  # divider + blank
+
+    # Live status bar — shown only while a task is actually in progress. The
+    # headline is the running task's own description (clean, already readable)
+    # plus an elapsed timer; the raw streamed tail is demoted to a dim detail.
+    running_task = next((t for t in tasks if t.get("status") == "running"), None)
+    if running_task:
+        desc    = (running_task.get("description") or "").strip()
+        elapsed = _elapsed_str(running_task.get("updated_at"))
+        bar_dim   = curses.color_pair(_CP_DIM) | curses.A_DIM
+        bar_white = curses.color_pair(_CP_WHITE)
+
+        _sp_draw_shimmer(win, y, 2, "Working")
+        if elapsed:
+            _sp_addstr(win, y, 2 + len("Working"), f" · {elapsed}",
+                       curses.color_pair(_CP_GOLD) | curses.A_BOLD)
+        y += 1
+        # Cap the headline to 2 lines so a long task description can't crowd out
+        # the task list below (or push the footer off-screen).
+        desc_lines = _wrap_hard(desc, right_w - 6)
+        if len(desc_lines) > 2:
+            desc_lines = desc_lines[:2]
+            desc_lines[-1] = desc_lines[-1][:max(0, right_w - 7)] + "…"
+        for ln in desc_lines:
+            _sp_addstr(win, y, 4, ln, bar_white)
+            y += 1
+        # A gently rotating progress phrase (cosmetic — the flame + timer already
+        # signal liveness; the description above is the real "what").
+        phrase = _STATUS_PHRASES[int(_time.time() / 3.5) % len(_STATUS_PHRASES)]
+        _sp_addstr(win, y, 4, phrase, bar_dim)
+        y += 1
+        _sp_addstr(win, y, 2, "─" * max(0, right_w - 4), bar_dim)
+        y += 2
+
+    # Task list — scrolls to keep the highlighted task in view when navigating.
+    task_area_h = h - 6
+    scroll_info = ""
+
+    if not tasks:
+        _sp_addstr(win, y, 2, "No tasks yet — stream is scanning...",
+                   curses.color_pair(_CP_DIM) | curses.A_DIM)
+    else:
+        n     = len(tasks)
+        avail = max(1, task_area_h - y)
+        # Centre the window on the cursor while navigating the pane; otherwise
+        # show the newest tasks from the top.
+        if focus_right and n > avail:
+            offset = max(0, min(task_i - avail // 2, n - avail))
+        else:
+            offset = 0
+        end = min(n, offset + avail)
+        if n > avail:
+            scroll_info = f"{offset + 1}–{end}/{n}"
+
+        for i in range(offset, end):
+            task        = tasks[i]
+            status      = task.get("status", "pending")
+            task_type   = (task.get("task_type") or "")[:8]
+            desc        = task.get("description", "")
+            type_col    = max(2, right_w - len(task_type) - 3)
+            highlighted = focus_right and i == task_i
+
+            if status == "running":
+                _sp_draw_flame(win, y, 1)   # three magic diamonds at cols 1-3
+                desc_x, desc_attr = 5, curses.color_pair(_CP_WHITE) | curses.A_BOLD
+            else:
+                if status == "done":
+                    icon, icon_attr = "✓", curses.color_pair(_CP_GREEN)
+                    desc_attr = curses.color_pair(_CP_DIM) | curses.A_DIM
+                elif status == "failed":
+                    icon, icon_attr = "✗", curses.color_pair(_CP_RED)
+                    desc_attr = curses.color_pair(_CP_DIM) | curses.A_DIM
+                elif not stream_enabled:    # pending but the stream is paused
+                    icon, icon_attr = "‖", curses.color_pair(_CP_GOLD) | curses.A_BOLD
+                    desc_attr = curses.color_pair(_CP_WHITE)
+                else:                        # pending, queued to run
+                    icon, icon_attr = "·", curses.color_pair(_CP_DIM) | curses.A_DIM
+                    desc_attr = curses.color_pair(_CP_WHITE)
+                desc_x = 4
+                _sp_addstr(win, y, 2, icon, icon_attr)
+
+            if highlighted:
+                desc_attr = curses.color_pair(_CP_SELECT) | curses.A_BOLD
+
+            max_desc = max(0, type_col - desc_x - 1)
+            _sp_addstr(win, y, desc_x, desc[:max_desc], desc_attr)
+            _sp_addstr(win, y, type_col, task_type,
+                       curses.color_pair(_CP_DIM) | curses.A_DIM)
+            y += 1
+
+    # Footer — context-sensitive hints / status
+    y = max(y + 1, h - 5)
+    _sp_addstr(win, y, 2, "─" * max(0, right_w - 4),
+               curses.color_pair(_CP_DIM) | curses.A_DIM)
+    if scroll_info:
+        tag = f" {scroll_info} "
+        _sp_addstr(win, y, max(2, right_w - len(tag) - 2), tag,
+                   curses.color_pair(_CP_GOLD))
+    y += 1
+
+    gold = curses.color_pair(_CP_GOLD) | curses.A_BOLD
+    dim  = curses.color_pair(_CP_DIM) | curses.A_DIM
+    sel  = tasks[task_i] if (focus_right and 0 <= task_i < len(tasks)) else None
+
+    if focus_right:
+        if sel and sel.get("status") == "pending" and not stream_enabled:
+            _sp_addstr(win, y, 2, "↵ run this task in the background", gold)
+            y += 1
+            _sp_addstr(win, y, 2, "↑↓ select   ← back", dim)
+        elif sel and sel.get("status") == "pending":
+            _sp_addstr(win, y, 2, "stream on — runs automatically", dim)
+            y += 1
+            _sp_addstr(win, y, 2, "↑↓ select   ← back", dim)
+        else:
+            _sp_addstr(win, y, 2, "↑↓ select   ← back", dim)
+    elif not stream_enabled:
+        if any(t.get("status") == "pending" for t in tasks):
+            _sp_addstr(win, y, 2, "‖ paused — press → to run a task", gold)
+        else:
+            _sp_addstr(win, y, 2, "‖ stream paused", dim)
+    else:
+        # Stream is on; the live status bar above shows the running task's
+        # progress, so the footer just confirms the stream is active.
+        _sp_addstr(win, y, 2, "● streaming", curses.color_pair(_CP_GREEN))
+
+    win.noutrefresh()
+
+
+def run_split_pane(get_state_fn, get_options_fn, handle_choice_fn,
+                   handle_task_fn=None):
+    """Run a curses split-pane UI.
+
+    get_state_fn(sel_orch_i) -> dict   fresh data each second
+    get_options_fn(state)    -> list   Option objects for left pane
+    handle_choice_fn(choice, text, state) -> None | "__refresh__" | "__quit__"
+      Called with curses already suspended (endwin called by run_split_pane).
+    handle_task_fn(task, state) -> None | "__refresh__" | "__quit__"
+      Optional. Invoked when the user presses Enter on a highlighted task in the
+      right pane. Called WITHOUT suspending curses (it must not print).
+
+    Left/Right arrows move focus between the option pane and the task pane.
+    """
+    import curses
+
+    def _inner(stdscr):
+        _sp_setup_colors()
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+
+        ui = {
+            "opt_i":        0,
+            "text":         "",
+            "cursor":       0,        # insertion point within the text field
+            "goal_col":     0,        # preferred column for vertical cursor moves
+            "texts":        {},       # per-option text, kept when switching options
+            "cursors":      {},       # per-option cursor position
+            "sel_orch_i":   0,
+            "last_refresh": 0.0,
+            "focus":        "left",   # "left" (options) or "right" (tasks)
+            "task_i":       0,        # highlighted task in the right pane (index)
+            "task_id":      None,     # ...anchored to the task's id, so the live
+                                      # list churning (new tasks prepended) doesn't
+                                      # drag the selection onto a different task
+        }
+        data = {}
+        left_win = right_win = None
+        prev_h = prev_w = 0
+
+        def _switch_option(new_idx, opts, field_w):
+            """Move selection to new_idx, preserving each option's typed text:
+            stash the current field, then restore the destination's buffer."""
+            old = opts[ui["opt_i"]] if opts and 0 <= ui["opt_i"] < len(opts) else None
+            if old is not None:
+                ui["texts"][old.value]   = ui["text"]
+                ui["cursors"][old.value] = ui["cursor"]
+            ui["opt_i"] = new_idx
+            new = opts[new_idx] if opts and 0 <= new_idx < len(opts) else None
+            val = new.value if new is not None else None
+            ui["text"]     = ui["texts"].get(val, "")
+            ui["cursor"]   = ui["cursors"].get(val, 0)
+            ui["goal_col"] = ui["cursor"] % field_w
+            ui["last_refresh"] = 0
+
+        while True:
+            now = _time.time()
+            if now - ui["last_refresh"] >= 1.0:
+                data = get_state_fn(ui["sel_orch_i"])
+                # Rebuild option list and clamp opt_i to active options
+                merged = {**data, **ui}
+                opts   = get_options_fn(merged)
+                active = [i for i, o in enumerate(opts) if not o.disabled]
+                if active and ui["opt_i"] not in active:
+                    ui["opt_i"] = active[0]
+                data["_opts"] = opts
+                # Keep the right-pane selection on the same task by id, so newly
+                # added tasks (prepended newest-first) don't shift it underneath.
+                if ui["focus"] == "right" and ui["task_id"] is not None:
+                    ids = [t.get("id") for t in data.get("tasks", [])]
+                    if ui["task_id"] in ids:
+                        ui["task_i"] = ids.index(ui["task_id"])
+                    elif ids:
+                        ui["task_i"] = min(ui["task_i"], len(ids) - 1)
+                ui["last_refresh"] = now
+
+            h, w = stdscr.getmaxyx()
+
+            if w < 60 or h < 20:
+                stdscr.erase()
+                msg = "Terminal too small — resize to continue"
+                _sp_addstr(stdscr, h // 2, max(0, (w - len(msg)) // 2), msg)
+                stdscr.refresh()
+                stdscr.getch()
+                _time.sleep(0.1)
+                continue
+
+            left_w  = min(42, w // 3)
+            right_w = w - left_w - 1
+
+            # Recreate sub-windows only when the terminal has been resized.
+            if h != prev_h or w != prev_w:
+                left_win  = curses.newwin(h, left_w, 0, 0)
+                right_win = curses.newwin(h, right_w, 0, left_w + 1)
+                prev_h, prev_w = h, w
+
+            opts   = data.get("_opts") or get_options_fn({**data, **ui})
+            merged = {**data, **ui, "opts": opts}
+
+            # Draw
+            stdscr.erase()
+            # Divider
+            dim_attr = curses.color_pair(_CP_DIM) | curses.A_DIM
+            for dy in range(h - 1):
+                _sp_addstr(stdscr, dy, left_w, "│", dim_attr)
+            stdscr.noutrefresh()
+
+            _sp_draw_left(left_win, merged)
+            _sp_draw_right(right_win, merged)
+            curses.doupdate()
+
+            key = stdscr.getch()
+            if key == -1:
+                _time.sleep(0.05)
+                continue
+
+            tasks   = data.get("tasks", [])
+            active  = [i for i, o in enumerate(opts) if not o.disabled]
+            cur_opt = opts[ui["opt_i"]] if opts and ui["opt_i"] < len(opts) else None
+            on_text = bool(cur_opt and cur_opt.text_input)
+            field_w = max(1, left_w - 4)
+
+            # --- focus-right (task pane) navigation ---
+            if ui["focus"] == "right" and key in (curses.KEY_LEFT, 27):  # ← / Esc
+                ui["focus"] = "left"
+                ui["last_refresh"] = 0
+                continue
+            if ui["focus"] == "right":
+                if not tasks:
+                    ui["focus"] = "left"
+                elif key == curses.KEY_UP:
+                    ui["task_i"] = (ui["task_i"] - 1) % len(tasks)
+                    ui["task_id"] = tasks[ui["task_i"]].get("id")
+                    ui["last_refresh"] = 0
+                elif key == curses.KEY_DOWN:
+                    ui["task_i"] = (ui["task_i"] + 1) % len(tasks)
+                    ui["task_id"] = tasks[ui["task_i"]].get("id")
+                    ui["last_refresh"] = 0
+                elif key in (10, 13):  # Enter — run the highlighted task
+                    if handle_task_fn and 0 <= ui["task_i"] < len(tasks):
+                        result = handle_task_fn(tasks[ui["task_i"]], merged)
+                        if result == "__quit__":
+                            return None
+                        if result == "__refresh__":
+                            return "__refresh__"
+                        ui["last_refresh"] = 0
+                elif key in (ord("q"), ord("Q")):
+                    return None
+                continue
+
+            # --- focus-left: the shared text editor on a selected text field,
+            # with the option pane / task pane handling its edges ---
+            if on_text:
+                ed  = {"text": ui["text"], "cursor": ui["cursor"], "goal_col": ui["goal_col"]}
+                act = _te_edit(ed, key, field_w)
+                if act == "edit":
+                    ui["text"], ui["cursor"], ui["goal_col"] = ed["text"], ed["cursor"], ed["goal_col"]
+                    continue
+                if act in ("left", "right"):
+                    if act == "right" and tasks:           # end of text → task pane
+                        ui["focus"]  = "right"
+                        ui["task_i"] = min(ui["task_i"], len(tasks) - 1)
+                        ui["task_id"] = tasks[ui["task_i"]].get("id")
+                        ui["last_refresh"] = 0
+                    continue                                # start of text → nothing
+                if act in ("top", "bottom"):
+                    if active:                              # cross a line edge → switch option
+                        idx  = active.index(ui["opt_i"]) if ui["opt_i"] in active else 0
+                        step = 1 if act == "bottom" else -1
+                        _switch_option(active[(idx + step) % len(active)], opts, field_w)
+                    continue
+                # act is None (Enter / Esc / Shift-Tab) → fall through to shared keys
+
+            # --- non-text option navigation + shared keys ---
+            if key == curses.KEY_RIGHT:                     # a non-text option → task pane
+                if tasks:
+                    ui["focus"]  = "right"
+                    ui["task_i"] = min(ui["task_i"], len(tasks) - 1)
+                    ui["task_id"] = tasks[ui["task_i"]].get("id")
+                    ui["last_refresh"] = 0
+            elif key == curses.KEY_LEFT:
+                pass                                        # no pane to the left
+            elif key in (curses.KEY_UP, curses.KEY_DOWN):
+                if active:
+                    idx  = active.index(ui["opt_i"]) if ui["opt_i"] in active else 0
+                    step = 1 if key == curses.KEY_DOWN else -1
+                    _switch_option(active[(idx + step) % len(active)], opts, field_w)
+            elif key == curses.KEY_BTAB:
+                orchs = data.get("orchs", [])
+                if len(orchs) > 1:
+                    ui["sel_orch_i"]   = (ui["sel_orch_i"] + 1) % len(orchs)
+                    ui["last_refresh"] = 0
+            elif key in (10, 13):  # Enter
+                if cur_opt is not None:
+                    choice_val  = cur_opt.value
+                    choice_text = ui["text"].strip()
+                    # The prompt was submitted — drop its kept buffer so it
+                    # doesn't reappear when the option is revisited.
+                    ui["texts"].pop(choice_val, None)
+                    ui["cursors"].pop(choice_val, None)
+                    ui["text"]  = ""
+                    ui["cursor"] = 0
+                    ui["goal_col"] = 0
+                    curses.endwin()
+                    result = handle_choice_fn(choice_val, choice_text, merged)
+                    stdscr.touchwin()
+                    stdscr.refresh()
+                    if result == "__refresh__":
+                        ui["last_refresh"] = 0
+                        return "__refresh__"
+                    if result == "__quit__":
+                        return None
+                    ui["last_refresh"] = 0  # re-draw after any action
+            elif key == 27 and not on_text:  # ESC
+                curses.endwin()
+                result = handle_choice_fn(None, "", merged)
+                stdscr.touchwin()
+                stdscr.refresh()
+                if result in ("__refresh__", "__quit__"):
+                    return None
+            elif key in (ord("q"), ord("Q")) and not on_text:
+                return None
+
+            _time.sleep(0.02)
+
+    return curses.wrapper(_inner)
+
+
+def select_menu(options, title="", hint=""):
+    """Single-pane selection menu that uses the same multi-line text editor as
+    the main split pane (soft-wrap, blinking block caret, gray placeholder,
+    cursor navigation, per-option drafts). Returns ``(value, text)`` like
+    :func:`menu`; Esc / q cancel to ``(None, "")``. Falls back to the numbered
+    prompt on a non-TTY stdin."""
+    if not sys.stdin.isatty():
+        return _menu_no_tty(options, title)
+
+    import curses
+
+    def _inner(stdscr):
+        _sp_setup_colors()
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+        active = [i for i, o in enumerate(options) if not o.disabled] or list(range(len(options)))
+        sel = active[0]
+        texts, cursors = {}, {}                 # per-option drafts, kept across switches
+        ed = {"text": "", "cursor": 0, "goal_col": 0}
+        field_w = 1
+
+        def _select(new_sel):
+            texts[sel] = ed["text"]; cursors[sel] = ed["cursor"]
+            ed["text"]     = texts.get(new_sel, "")
+            ed["cursor"]   = cursors.get(new_sel, 0)
+            ed["goal_col"] = ed["cursor"] % field_w
+            return new_sel
+
+        while True:
+            h, w = stdscr.getmaxyx()
+            field_w = max(1, w - 6)
+            stdscr.erase()
+            y = 0
+            for line in WIZARD_COMPACT:
+                _sp_addstr(stdscr, y, 2, line, curses.color_pair(_CP_WHITE) | curses.A_BOLD)
+                y += 1
+            y += 1
+            if title:
+                _sp_addstr(stdscr, y, 2, title, curses.color_pair(_CP_CYAN) | curses.A_BOLD)
+                y += 1
+            if hint:
+                _sp_addstr(stdscr, y, 2, hint, curses.color_pair(_CP_DIM) | curses.A_DIM)
+                y += 1
+            y += 1
+            for i, opt in enumerate(options):
+                if y >= h - 1:
+                    break
+                selected = (i == sel)
+                if opt.disabled:
+                    _sp_addstr(stdscr, y, 2, f"  {opt.label}  (coming soon)",
+                               curses.color_pair(_CP_DIM) | curses.A_DIM)
+                elif selected and opt.text_input:
+                    _sp_addstr(stdscr, y, 2, "> ", curses.color_pair(_CP_GOLD) | curses.A_BOLD)
+                    if ed["text"]:
+                        display, attr, cur = ed["text"], curses.color_pair(_CP_WHITE), ed["cursor"]
+                    else:
+                        display = opt.placeholder or opt.label
+                        attr, cur = curses.color_pair(_CP_DIM) | curses.A_DIM, 0
+                    caret = cur if int(_time.time() * 2) % 2 == 0 else None
+                    y += _te_render(stdscr, y, 4, field_w, display, attr, caret) - 1
+                elif selected:
+                    _sp_addstr(stdscr, y, 2, f"> {opt.label}",
+                               curses.color_pair(_CP_SELECT) | curses.A_BOLD)
+                else:
+                    # show a kept draft (collapsed) instead of the placeholder/label
+                    _sp_addstr(stdscr, y, 4, (texts.get(i) or opt.label),
+                               curses.color_pair(_CP_WHITE))
+                y += 1
+            stdscr.noutrefresh()
+            curses.doupdate()
+
+            key = stdscr.getch()
+            if key == -1:
+                _time.sleep(0.05)
+                continue
+
+            cur_opt = options[sel]
+            on_text = cur_opt.text_input
+            if on_text:
+                act = _te_edit(ed, key, field_w)
+                if act == "edit":
+                    continue
+                if act in ("left", "right"):
+                    continue                            # no side panes here
+                if act in ("top", "bottom"):
+                    idx  = active.index(sel) if sel in active else 0
+                    step = 1 if act == "bottom" else -1
+                    sel  = _select(active[(idx + step) % len(active)])
+                    continue
+                # act None (Enter / Esc) → fall through
+
+            if key in (curses.KEY_UP, curses.KEY_DOWN):
+                idx  = active.index(sel) if sel in active else 0
+                step = 1 if key == curses.KEY_DOWN else -1
+                sel  = _select(active[(idx + step) % len(active)])
+            elif key in (10, 13):  # Enter
+                return cur_opt.value, ed["text"].strip()
+            elif key == 27 and not on_text:  # Esc
+                return None, ""
+            elif key in (ord("q"), ord("Q")) and not on_text:
+                return None, ""
+
+    return curses.wrapper(_inner)

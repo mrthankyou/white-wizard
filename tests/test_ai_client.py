@@ -65,9 +65,9 @@ class ParseArgsTests(unittest.TestCase):
         try:
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
-                flags = ai_client.parse_args(["--mock", "--stream"])
+                ai_client.parse_args(["--claude"])
             self.assertEqual(err.getvalue(), "")
-            self.assertTrue(flags["stream"])
+            self.assertEqual(ai_client._backend, "claude")
         finally:
             ai_client._backend = saved
 

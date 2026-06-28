@@ -5,21 +5,16 @@ from white_wizard import db as wizard_db
 
 def main():
     wizard_db.init_db()
-    flags = ai_client.parse_args()
-    if flags["debug"]:
-        from white_wizard.app import color, DIM, WHITE
-        print(color(f"  Debug logging enabled → {ai_client.debug_log_path()}\n", DIM, WHITE))
+    ai_client.parse_args()
+    ai_client.enable_debug_logging()  # always-on AI prompt/response trace
     try:
-        if flags["stream"]:
-            app.run_stream_mode()
-        else:
-            app.main()
+        app.main()
     except (KeyboardInterrupt, EOFError):
-        ai_client.kill_current()
+        app._shutdown_stream_workers()
         from white_wizard.app import color, DIM, WHITE
         print(color("\n\n  The staff dims. Farewell.\n", DIM, WHITE))
     except RuntimeError as exc:
-        ai_client.kill_current()
+        app._shutdown_stream_workers()
         from white_wizard.app import color, DIM, WHITE
         print(color(f"\n\n  The spell fizzles — {exc}\n", DIM, WHITE))
 
