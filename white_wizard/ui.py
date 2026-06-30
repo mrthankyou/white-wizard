@@ -309,6 +309,18 @@ _STATUS_PHRASES = (
 )
 
 
+def _status_label(status):
+    """Human-readable label + curses color-pair id for a task status, shown above
+    the highlighted task's description in the right pane."""
+    return {
+        "done":      ("✓ Completed",     _CP_GREEN),
+        "pending":   ("○ To do",         _CP_GOLD),
+        "running":   ("● In progress",   _CP_CYAN),
+        "failed":    ("✗ Cancelled",     _CP_RED),
+        "suggested": ("● Suggested fix", _CP_BLUE),
+    }.get(status, (f"• {status or 'unknown'}", _CP_DIM))
+
+
 def _format_task_time(ts):
     """Format a SQLite UTC datetime string to local 'Mon D HH:MM' ('' if bad)."""
     import datetime
@@ -638,19 +650,22 @@ def _sp_draw_right(win, state):
         _sp_addstr(win, y, 2, "─" * max(0, right_w - 4), bar_dim)
         y += 2
 
-    # Pre-compute selected task for footer description.
+    # Pre-compute selected task for footer status + description.
     sel = tasks[task_i] if (focus_right and 0 <= task_i < len(tasks)) else None
+    sel_status_label = sel_status_cp = None
     desc_footer_lines = []
     if sel:
+        sel_status_label, sel_status_cp = _status_label(sel.get("status", "pending"))
         d = (sel.get("description") or "").strip()
         if d:
             wrapped = _wrap_hard(d, right_w - 4)
             desc_footer_lines = wrapped[:3]
             if len(wrapped) > 3:
                 desc_footer_lines[-1] = desc_footer_lines[-1][:max(0, right_w - 5)] + "…"
+    status_lines = 1 if sel_status_label else 0
 
     # Task list — scrolls to keep the highlighted task in view when navigating.
-    task_area_h = max(0, h - 6 - len(desc_footer_lines))
+    task_area_h = max(0, h - 6 - len(desc_footer_lines) - status_lines)
     scroll_info = ""
 
     if not tasks:
@@ -721,7 +736,7 @@ def _sp_draw_right(win, state):
             y += 1
 
     # Footer — context-sensitive hints / status
-    y = max(y + 1, h - 5 - len(desc_footer_lines))
+    y = max(y + 1, h - 5 - len(desc_footer_lines) - status_lines)
     _sp_addstr(win, y, 2, "─" * max(0, right_w - 4),
                curses.color_pair(_CP_DIM) | curses.A_DIM)
     ts = _format_task_time(sel.get("updated_at") or sel.get("created_at", "")) if sel else ""
@@ -733,6 +748,10 @@ def _sp_draw_right(win, state):
                    curses.color_pair(_CP_GOLD))
     y += 1
 
+    if sel_status_label:
+        _sp_addstr(win, y, 2, sel_status_label,
+                   curses.color_pair(sel_status_cp) | curses.A_BOLD)
+        y += 1
     for ln in desc_footer_lines:
         _sp_addstr(win, y, 2, ln, curses.color_pair(_CP_WHITE))
         y += 1
