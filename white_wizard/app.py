@@ -286,6 +286,19 @@ def _set_auto_commit(enabled):
     save_wizard_yaml_data(data)
 
 
+def _auto_fix_enabled():
+    """Whether the stream autonomously fixes scan findings (wizard.yaml setting,
+    default OFF). When off, findings are 'suggested' and run only on demand."""
+    return bool(load_wizard_yaml().get("settings", {}).get("auto_fix", False))
+
+
+def _set_auto_fix(enabled):
+    """Persist the autonomous auto-fix preference to wizard.yaml settings."""
+    data = load_wizard_yaml()
+    data.setdefault("settings", {})["auto_fix"] = bool(enabled)
+    save_wizard_yaml_data(data)
+
+
 # ---------------------------------------------------------------------------
 # Alert queue — lets one action push a message that the next menu screen shows
 # ---------------------------------------------------------------------------
@@ -754,6 +767,31 @@ def _confirm_and_wipe():
     return bool(removed), name if removed else None
 
 
+def _confirm_and_clear_tasks(orch):
+    """Confirm, then delete all tasks (queue, scan findings, history) for this
+    orchestration — keeping the orchestration itself. Returns the number of tasks
+    removed (0 if cancelled or none)."""
+    folder = orch.get("team_folder", "") if orch else ""
+    if not folder:
+        return 0
+    team = orch.get("team", "this orchestration")
+
+    def render_top():
+        print(color(f"  Clear all tasks for '{team}'?\n", BOLD, WHITE))
+        print(color("  Removes the task queue, scan findings, and history for this", DIM, WHITE))
+        print(color("  orchestration. The orchestration itself is kept.\n", DIM, WHITE))
+
+    value, _ = menu(
+        [Option(True, "Yes, clear them"), Option(False, "No, keep them")],
+        title="Are you sure?",
+        hint="(arrows · Enter to choose)",
+        render_top=render_top,
+    )
+    if value is not True:
+        return 0
+    return wizard_db.delete_tasks_for_orch(folder)
+
+
 # ---------------------------------------------------------------------------
 # wizard.yaml / handle existing
 # ---------------------------------------------------------------------------
@@ -840,6 +878,7 @@ def handle_wizard_yaml():
             "mode":           shared["mode"],
             "stream_enabled": wizard_db.is_stream_enabled(folder) if folder else True,
             "auto_commit":    _auto_commit_enabled(),
+            "auto_fix":       _auto_fix_enabled(),
             "tasks":          wizard_db.get_tasks_for_orch(folder) if folder else [],
         }
 
@@ -850,12 +889,15 @@ def handle_wizard_yaml():
             return [
                 Option("adjust", "Adjust the orchestration", text_input=True,
                        placeholder="What should change?"),
+                Option("clear_tasks", "Clear all tasks & findings"),
                 Option("back",   "← Back"),
             ]
         task_label = f"What do you want the {team} to do?"
         stream_label = "Disable stream" if state.get("stream_enabled") else "Enable stream"
         ac_label = ("Disable auto-commit" if state.get("auto_commit", True)
                     else "Enable auto-commit")
+        af_label = ("Disable auto-fix (findings)" if state.get("auto_fix", False)
+                    else "Enable auto-fix (findings)")
         return [
             Option("task",          task_label, text_input=True, placeholder=task_label),
             Option("manage",        "Manage the system"),
@@ -865,6 +907,7 @@ def handle_wizard_yaml():
                    placeholder="Something else"),
             Option("stream_toggle", stream_label),
             Option("autocommit_toggle", ac_label),
+            Option("autofix_toggle", af_label),
             Option("wipe",          "Wipe the orchestration system"),
             Option("quit",          "Quit (stop background AI)"),
         ]
@@ -883,6 +926,12 @@ def handle_wizard_yaml():
                 shared["mode"] = "main"
             elif choice == "adjust" and text:
                 _prompt_orchestration(text)
+            elif choice == "clear_tasks":
+                n = _confirm_and_clear_tasks(orch)
+                if n:
+                    folder = orch.get("team_folder", "") if orch else ""
+                    _stream_log(f"[{folder}] cleared {n} task(s) by user")
+                    shared["alerts"] = [f"Cleared {n} task(s)."]
         else:
             if choice == "wipe":
                 folder_before_wipe = orch.get("team_folder", "") if orch else ""
@@ -929,19 +978,36 @@ def handle_wizard_yaml():
                 status = "disabled" if now_on else "enabled"
                 _stream_log(f"auto-commit {status} by user")
                 shared["alerts"] = [f"Auto-commit {status}."]
+            elif choice == "autofix_toggle":
+                now_on = _auto_fix_enabled()
+                _set_auto_fix(not now_on)
+                status = "disabled" if now_on else "enabled"
+                _stream_log(f"auto-fix {status} by user")
+                shared["alerts"] = [
+                    "Auto-fix enabled — the stream will fix scan findings automatically."
+                    if not now_on else
+                    "Auto-fix disabled — findings stay as suggestions (run with Enter)."]
             elif choice == "quit":
                 return "__quit__"
         return None  # stay in pane, redraw
 
     def handle_task_fn(task, state):
-        """Run a single highlighted task on demand from the right pane.
+        """Act on the highlighted task from the right pane (Enter).
 
-        Only acts on a not-yet-run task. When the stream is paused this is the
-        way to run one task without turning the whole stream back on; when the
-        stream is on, the worker already runs it, so we just note that.
+        - A 'suggested' scan finding is dispatched as real work (agentic edit +
+          commit), regardless of stream state.
+        - A 'pending' task is run on demand while the stream is paused (when it's
+          on, the worker already runs it, so we just note that).
         """
         orch = state.get("current_orch")
-        if not orch or not task or task.get("status") != "pending":
+        if not orch or not task:
+            return None
+        status = task.get("status")
+        if status == "suggested":
+            _dispatch_finding(orch, task)
+            shared["alerts"] = [f"Fixing: {task.get('description', '')[:50]}"]
+            return None
+        if status != "pending":
             return None
         folder = orch.get("team_folder", "")
         if wizard_db.is_stream_enabled(folder):
@@ -1026,7 +1092,7 @@ OPTIONS = [
 
 
 def select(options, title,
-           hint="(arrows to move - type to fill in 'Something else' - Enter to choose - q to quit)"):
+           hint="(↑↓ move · type to fill in 'Something else' · ←→ edit text · Enter to choose · Esc to cancel)"):
     """Pick one of ``options`` (a list of label strings).
 
     Returns the chosen label, the typed text for the custom option,
@@ -1243,7 +1309,7 @@ def _smoke_test(team_dir, orch):
 
 
 def show_orchestration_created(team_selection, team_dir, smoke_ok=None, smoke_checks=None,
-                               mcp_status=None, mcp_detail=""):
+                               mcp_status=None, mcp_detail="", committed=None):
     """Show the Claude-native subagent files that were written, smoke-test results, and how to run."""
     clear()
     show_header_compact()
@@ -1274,6 +1340,9 @@ def show_orchestration_created(team_selection, team_dir, smoke_ok=None, smoke_ch
         print(color(f"      pip install mcp   ({mcp_detail})" if mcp_detail
                     else "      pip install mcp", GRAY))
     print()
+    if committed:
+        print(color(f"  ✓ Committed to git ({committed}).", BOLD, GOLD))
+        print()
     print(color(f"  Lead orchestrator: {orch.get('orchestrator', 'orchestrator')}  "
                 "(delegates via the state-machine MCP tool)", DIM, WHITE))
     print(color("  Your team is ready.\n", BOLD, GOLD))
@@ -1334,11 +1403,17 @@ def run_team_conversation(team_selection, synopsis, custom_description=""):
     loading("Running a smoke test on the orchestration...", seconds=1.6)
     ok, checks = _smoke_test(team_dir, load_orchestration() or {})
 
+    # Commit the built orchestration to git once the smoke test passes (honours
+    # the same auto-commit setting as task commits; no-ops outside a git repo).
+    committed = (_commit_built_orchestration(team_selection, team_dir)
+                 if ok and _auto_commit_enabled() else None)
+
     remaining = MIN_BUILD_DISPLAY_SECONDS - (time.time() - build_start)
     if remaining > 0:
         loading("Finalising the orchestration...", seconds=remaining)
 
-    show_orchestration_created(team_selection, team_dir, ok, checks, mcp_status, mcp_detail)
+    show_orchestration_created(team_selection, team_dir, ok, checks, mcp_status, mcp_detail,
+                               committed=committed)
 
     # Ask the AI for any project-specific stream tasks based on what it just built.
     extra_stream_tasks = []
@@ -1523,6 +1598,25 @@ def _git_commit(paths, message):
         return None
 
 
+def _commit_built_orchestration(team_label, team_dir):
+    """Commit a freshly built orchestration (after its smoke test passes): the
+    generated subagents, the manifest, and the MCP config. Best-effort — reuses
+    ``_git_commit``, which no-ops outside a git repo or when the index already
+    has staged changes. Returns the short commit hash, or None."""
+    cwd = os.getcwd()
+    candidates = [team_dir, _manifest_path(),
+                  os.path.join(cwd, ".mcp.json"),
+                  os.path.join(cwd, "wizard.yaml")]
+    paths = [os.path.relpath(p, cwd) for p in candidates if os.path.exists(p)]
+    if not paths:
+        return None
+    label = team_label.replace("Create ", "").title()
+    msg = (f"Add {label} orchestration\n\n"
+           "Generated by White Wizard — subagents, state-machine MCP tool, and "
+           "config. Committed after the build's smoke test passed.")
+    return _git_commit(paths, msg)
+
+
 # Only one agentic task edits the working tree at a time: concurrent edits — and
 # the repo-wide git verification (and commit) wrapped around them — would corrupt
 # each other.
@@ -1558,10 +1652,14 @@ class StreamWorker(threading.Thread):
                     time.sleep(2)
                     continue
                 task = wizard_db.get_next_pending_task(self.orch_folder)
+                finding = (wizard_db.get_next_suggested(self.orch_folder)
+                           if _auto_fix_enabled() else None)
                 if task:
                     self._log(f"picked queued task #{task['id']} "
                               f"[{task['task_type']}] {task['description']}")
                     self._execute(task["id"], task["description"], task["task_type"])
+                elif finding:                       # autonomous auto-fix is on
+                    self._run_finding(finding)
                 else:
                     task_type, desc = self._cycle[self._idx % len(self._cycle)]
                     self._idx += 1
@@ -1592,8 +1690,11 @@ class StreamWorker(threading.Thread):
             for f in findings[:8]:
                 d = f.get("description", "")[:200]
                 if d:
-                    tid = wizard_db.add_task(self.orch_folder, d, task_type)
-                    wizard_db.complete_task(tid, "identified")  # log-only; don't re-execute
+                    # A finding is an actionable suggestion: 'suggested' so the
+                    # user can run it on demand (or auto-fix can drain it), but it
+                    # isn't auto-queued like a 'pending' task.
+                    tid = wizard_db.add_task(self.orch_folder, d, task_type,
+                                             status="suggested")
                     self._log(f"  finding #{tid} [{task_type}] {d}")
             summary = f"Found {len(findings)} item(s)" if findings else "Nothing to flag"
             wizard_db.complete_task(task_id, summary)
@@ -1648,6 +1749,16 @@ class StreamWorker(threading.Thread):
         if not auto:
             return True, f"Changed {len(new)} file(s): {listed} (auto-commit off)"
         return True, f"Changed {len(new)} file(s): {listed} (auto-commit skipped)"
+
+    def _run_finding(self, task):
+        """Carry out a scan finding as real work (agentic edit + commit, same path
+        as a user task — the finding text is the work), then mark it done/failed."""
+        self._log(f"fixing finding #{task['id']}: {task['description'][:80]}")
+        wizard_db.set_task_running(task["id"])
+        ok, summary = self._run_user_task(
+            "Address this code-review finding: " + task["description"])
+        (wizard_db.complete_task if ok else wizard_db.fail_task)(task["id"], summary)
+        self._log(f"finding #{task['id']} {'fixed' if ok else 'unresolved'}: {summary[:100]}")
 
     def _commit_message(self, description, result=""):
         """Build a commit message. The subject is the agent's own one-line summary
@@ -1745,6 +1856,14 @@ def _run_task_once(orch, task):
             task["id"], task["description"], task["task_type"]),
         daemon=True,
     ).start()
+
+
+def _dispatch_finding(orch, task):
+    """Run a scan finding as real work on demand (agentic edit + commit), in a
+    one-shot background thread — used when the user presses Enter on a suggested
+    finding in the task pane."""
+    worker = StreamWorker(orch)
+    threading.Thread(target=lambda: worker._run_finding(task), daemon=True).start()
 
 
 def _shutdown_stream_workers():

@@ -622,12 +622,25 @@ def _sp_draw_right(win, state):
         _sp_addstr(win, y, 2, "─" * max(0, right_w - 4), bar_dim)
         y += 2
 
+    # Pre-compute selected task for footer description.
+    sel = tasks[task_i] if (focus_right and 0 <= task_i < len(tasks)) else None
+    desc_footer_lines = []
+    if sel:
+        d = (sel.get("description") or "").strip()
+        if d:
+            wrapped = _wrap_hard(d, right_w - 4)
+            desc_footer_lines = wrapped[:3]
+            if len(wrapped) > 3:
+                desc_footer_lines[-1] = desc_footer_lines[-1][:max(0, right_w - 5)] + "…"
+
     # Task list — scrolls to keep the highlighted task in view when navigating.
-    task_area_h = h - 6
+    task_area_h = h - 6 - len(desc_footer_lines)
     scroll_info = ""
 
     if not tasks:
-        _sp_addstr(win, y, 2, "No tasks yet — stream is scanning...",
+        empty_msg = ("No tasks yet — stream is scanning..." if stream_enabled
+                     else "No tasks yet — stream is paused.")
+        _sp_addstr(win, y, 2, empty_msg,
                    curses.color_pair(_CP_DIM) | curses.A_DIM)
     else:
         n     = len(tasks)
@@ -647,7 +660,11 @@ def _sp_draw_right(win, state):
             status      = task.get("status", "pending")
             task_type   = (task.get("task_type") or "")[:8]
             desc        = task.get("description", "")
-            type_col    = max(2, right_w - len(task_type) - 3)
+            # Anything that isn't a user-submitted task is a recurring scan; mark
+            # it with a ↻ glyph so the two kinds are distinguishable at a glance.
+            is_scan     = bool(task_type) and task_type != "user"
+            label_w     = len(task_type) + (2 if is_scan else 0)  # room for "↻ "
+            type_col    = max(2, right_w - label_w - 3)
             highlighted = focus_right and i == task_i
 
             if status == "running":
@@ -660,6 +677,10 @@ def _sp_draw_right(win, state):
                 elif status == "failed":
                     icon, icon_attr = "✗", curses.color_pair(_CP_RED)
                     desc_attr = curses.color_pair(_CP_DIM) | curses.A_DIM
+                elif status == "suggested":  # actionable scan finding — Enter to fix
+                    # A blue dot (not a ✓, which would imply it's already done).
+                    icon, icon_attr = "●", curses.color_pair(_CP_BLUE) | curses.A_BOLD
+                    desc_attr = curses.color_pair(_CP_WHITE)
                 elif not stream_enabled:    # pending but the stream is paused
                     icon, icon_attr = "‖", curses.color_pair(_CP_GOLD) | curses.A_BOLD
                     desc_attr = curses.color_pair(_CP_WHITE)
@@ -674,12 +695,17 @@ def _sp_draw_right(win, state):
 
             max_desc = max(0, type_col - desc_x - 1)
             _sp_addstr(win, y, desc_x, desc[:max_desc], desc_attr)
-            _sp_addstr(win, y, type_col, task_type,
-                       curses.color_pair(_CP_DIM) | curses.A_DIM)
+            if is_scan:   # recurring-scan marker, then the type label
+                _sp_addstr(win, y, type_col, "↻", curses.color_pair(_CP_CYAN))
+                _sp_addstr(win, y, type_col + 2, task_type,
+                           curses.color_pair(_CP_DIM) | curses.A_DIM)
+            else:
+                _sp_addstr(win, y, type_col, task_type,
+                           curses.color_pair(_CP_DIM) | curses.A_DIM)
             y += 1
 
     # Footer — context-sensitive hints / status
-    y = max(y + 1, h - 5)
+    y = max(y + 1, h - 5 - len(desc_footer_lines))
     _sp_addstr(win, y, 2, "─" * max(0, right_w - 4),
                curses.color_pair(_CP_DIM) | curses.A_DIM)
     if scroll_info:
@@ -688,13 +714,20 @@ def _sp_draw_right(win, state):
                    curses.color_pair(_CP_GOLD))
     y += 1
 
+    for ln in desc_footer_lines:
+        _sp_addstr(win, y, 2, ln, curses.color_pair(_CP_WHITE))
+        y += 1
+
     gold = curses.color_pair(_CP_GOLD) | curses.A_BOLD
     dim  = curses.color_pair(_CP_DIM) | curses.A_DIM
-    sel  = tasks[task_i] if (focus_right and 0 <= task_i < len(tasks)) else None
 
     if focus_right:
-        if sel and sel.get("status") == "pending" and not stream_enabled:
-            _sp_addstr(win, y, 2, "↵ run this task in the background", gold)
+        if sel and sel.get("status") == "suggested":
+            _sp_addstr(win, y, 2, "press Enter to fix this finding (runs in background)", gold)
+            y += 1
+            _sp_addstr(win, y, 2, "↑↓ select   ← back", dim)
+        elif sel and sel.get("status") == "pending" and not stream_enabled:
+            _sp_addstr(win, y, 2, "press Enter to run this task (in background)", gold)
             y += 1
             _sp_addstr(win, y, 2, "↑↓ select   ← back", dim)
         elif sel and sel.get("status") == "pending":
@@ -703,15 +736,17 @@ def _sp_draw_right(win, state):
             _sp_addstr(win, y, 2, "↑↓ select   ← back", dim)
         else:
             _sp_addstr(win, y, 2, "↑↓ select   ← back", dim)
-    elif not stream_enabled:
-        if any(t.get("status") == "pending" for t in tasks):
-            _sp_addstr(win, y, 2, "‖ paused — press → to run a task", gold)
-        else:
-            _sp_addstr(win, y, 2, "‖ stream paused", dim)
     else:
-        # Stream is on; the live status bar above shows the running task's
-        # progress, so the footer just confirms the stream is active.
-        _sp_addstr(win, y, 2, "● streaming", curses.color_pair(_CP_GREEN))
+        # Not in the task pane — point the user at actionable items and how to
+        # fire them (→ to enter the pane, then Enter to run the highlighted one).
+        if any(t.get("status") == "suggested" for t in tasks):
+            _sp_addstr(win, y, 2, "→ pick a finding, then Enter to fix it", gold)
+        elif not stream_enabled and any(t.get("status") == "pending" for t in tasks):
+            _sp_addstr(win, y, 2, "‖ paused — → pick a task, then Enter to run it", gold)
+        elif not stream_enabled:
+            _sp_addstr(win, y, 2, "‖ stream paused", dim)
+        else:
+            _sp_addstr(win, y, 2, "● streaming", curses.color_pair(_CP_GREEN))
 
     win.noutrefresh()
 
@@ -1042,8 +1077,8 @@ def select_menu(options, title="", hint=""):
                 sel  = _select(active[(idx + step) % len(active)])
             elif key in (10, 13):  # Enter
                 return cur_opt.value, ed["text"].strip()
-            elif key == 27 and not on_text:  # Esc
-                return None, ""
+            elif key == 27:  # Esc cancels from anywhere (incl. the text field) —
+                return None, ""   # the build menu has no other "back out" key
             elif key in (ord("q"), ord("Q")) and not on_text:
                 return None, ""
 

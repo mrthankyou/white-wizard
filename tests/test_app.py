@@ -600,5 +600,119 @@ class WipeAndPruneTest(unittest.TestCase):
         self.assertEqual(wizard_db.get_tasks_for_orch("ghost_team"), [])
 
 
+class CommitBuiltOrchestrationTest(unittest.TestCase):
+    """A freshly built orchestration is committed to git (subagents + manifest)."""
+
+    def setUp(self):
+        self.origin = os.getcwd()
+        self.tmp = tempfile.mkdtemp(prefix="ww_buildcommit_")
+        os.chdir(self.tmp)
+
+    def tearDown(self):
+        os.chdir(self.origin)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_commits_orchestration_files_in_git_repo(self):
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        for args in (["init", "-q"], ["config", "user.email", "t@t"],
+                     ["config", "user.name", "t"]):
+            subprocess.run(["git", *args], cwd=self.tmp, check=True)
+        # Build the path from cwd (as write_orchestration does) so it matches the
+        # resolved cwd — on macOS mkdtemp's /var/... differs from getcwd's
+        # /private/var/..., which would break relpath.
+        team_dir = os.path.join(os.getcwd(), ".claude", "agents", "dev_team")
+        os.makedirs(team_dir)
+        with open(os.path.join(team_dir, "planner.md"), "w") as f:
+            f.write("---\nname: planner\n---\nbody\n")
+        app._save_orchestration({"team": "Dev Team", "team_folder": "dev_team",
+                                 "orchestrator": "dev-orchestrator",
+                                 "agents": [{"name": "planner"}],
+                                 "transitions": [], "mcp_tools": [], "mcp_servers": []})
+
+        ref = app._commit_built_orchestration("Create dev team", team_dir)
+
+        self.assertTrue(ref)
+        names = subprocess.run(["git", "show", "--name-only", "--format=", "HEAD"],
+                               cwd=self.tmp, capture_output=True, text=True).stdout
+        self.assertIn("planner.md", names)
+        self.assertIn("wizard-orch.json", names)
+
+
+class StreamFindingsTest(unittest.TestCase):
+    """Scan findings are actionable 'suggested' tasks: not auto-queued, runnable
+    on demand (and by autonomous auto-fix) via the agentic edit path."""
+
+    def setUp(self):
+        self.origin = os.getcwd()
+        self.tmp = tempfile.mkdtemp(prefix="ww_findings_")
+        os.chdir(self.tmp)
+        os.makedirs(os.path.join(self.tmp, ".claude", "agents"))
+        wizard_db.init_db()
+
+    def tearDown(self):
+        os.chdir(self.origin)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_findings_are_suggested_not_auto_queued(self):
+        tid = wizard_db.add_task("dev_team", "doc gap", "doc", status="suggested")
+        # The stream's pending queue must not pick it up…
+        self.assertIsNone(wizard_db.get_next_pending_task("dev_team"))
+        # …but it is available to the suggestion (auto-fix) queue.
+        self.assertEqual(wizard_db.get_next_suggested("dev_team")["id"], tid)
+
+    def test_auto_fix_setting_defaults_off_and_round_trips(self):
+        self.assertFalse(app._auto_fix_enabled())
+        app._set_auto_fix(True)
+        self.assertTrue(app._auto_fix_enabled())
+
+    def test_run_finding_does_agentic_work_and_completes(self):
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        for a in (["init", "-q"], ["config", "user.email", "t@t"],
+                  ["config", "user.name", "t"],
+                  ["commit", "-q", "--allow-empty", "-m", "init"]):
+            subprocess.run(["git", *a], cwd=self.tmp, check=True)
+        app._save_orchestration({"team": "Dev Team", "team_folder": "dev_team",
+                                 "orchestrator": "o", "agents": [{"name": "a"}],
+                                 "transitions": [], "mcp_tools": [], "mcp_servers": []})
+        orch = app.load_orchestration()
+        tid = wizard_db.add_task("dev_team", "Document the @ alias", "doc",
+                                 status="suggested")
+        worker = app.StreamWorker(orch)
+
+        def fake_run_task(prompt, **kw):
+            with open(os.path.join(self.tmp, "DOCS.md"), "w") as f:
+                f.write("docs\n")
+            return "Documented the alias in DOCS.md"
+
+        with mock.patch.object(app, "run_task", fake_run_task):
+            worker._run_finding({"id": tid, "description": "Document the @ alias",
+                                 "task_type": "doc"})
+
+        row = next(t for t in wizard_db.get_tasks_for_orch("dev_team") if t["id"] == tid)
+        self.assertEqual(row["status"], "done")          # finding resolved
+        count = subprocess.run(["git", "rev-list", "--count", "HEAD"],
+                               cwd=self.tmp, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(count, "2")                      # init + the fix commit
+
+    def test_clear_tasks_removes_only_that_orchs_tasks(self):
+        wizard_db.add_task("dev_team", "a", "user")
+        wizard_db.add_task("dev_team", "b", "bug", status="suggested")
+        wizard_db.add_task("other_team", "c", "user")
+        with mock.patch.object(app, "menu", lambda *a, **k: (True, "")):  # confirm yes
+            n = app._confirm_and_clear_tasks({"team_folder": "dev_team", "team": "Dev"})
+        self.assertEqual(n, 2)
+        self.assertEqual(wizard_db.get_tasks_for_orch("dev_team"), [])
+        self.assertEqual(len(wizard_db.get_tasks_for_orch("other_team")), 1)
+
+    def test_clear_tasks_cancelled_keeps_them(self):
+        wizard_db.add_task("dev_team", "a", "user")
+        with mock.patch.object(app, "menu", lambda *a, **k: (False, "")):  # decline
+            n = app._confirm_and_clear_tasks({"team_folder": "dev_team", "team": "Dev"})
+        self.assertEqual(n, 0)
+        self.assertEqual(len(wizard_db.get_tasks_for_orch("dev_team")), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,5 +7,8 @@
         "prompt": "hello"
       }
     ]
+  },
+  "settings": {
+    "default_model": "claude-sonnet-4-6"
   }
 }

@@ -103,17 +103,34 @@ def set_stream_enabled(orch_folder, enabled):
 # Task helpers
 # ---------------------------------------------------------------------------
 
-def add_task(orch_folder, description, task_type, is_user_prompt=False):
-    """Insert a new task and return its id."""
+def add_task(orch_folder, description, task_type, is_user_prompt=False, status="pending"):
+    """Insert a new task and return its id. ``status`` defaults to 'pending';
+    scan findings are inserted as 'suggested' (actionable but not auto-queued)."""
     init_db()
     with _session() as conn:
         cur = conn.execute(
             "INSERT INTO tasks "
-            "(orch_folder, description, task_type, is_user_prompt, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))",
-            (orch_folder, description, task_type, int(is_user_prompt)),
+            "(orch_folder, description, task_type, is_user_prompt, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+            (orch_folder, description, task_type, int(is_user_prompt), status),
         )
         return cur.lastrowid
+
+
+def get_next_suggested(orch_folder):
+    """Return the oldest 'suggested' scan finding for this orch (or None) — used
+    by autonomous auto-fix to drain the suggestion queue."""
+    try:
+        init_db()
+        with _session() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks "
+                "WHERE orch_folder = ? AND status = 'suggested' ORDER BY id ASC LIMIT 1",
+                (orch_folder,),
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
 
 
 def get_next_pending_task(orch_folder):

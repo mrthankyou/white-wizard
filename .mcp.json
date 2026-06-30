@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "dev-state-machine": {
+      "command": "/Library/Developer/CommandLineTools/usr/bin/python3",
+      "args": [
+        ".claude/agents/dev_team/state_machine.py"
+      ]
+    }
+  }
+}
