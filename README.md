@@ -15,9 +15,29 @@
           The White Wizard
 ```
 
-**Run your project at the AI level.** White Wizard gives any codebase a team of AI
-agents that build features, watch for problems, and improve themselves — all from
-one command.
+**Build, run, and manage multiple AI agents at once — with one command.**
+
+---
+
+## Quick start
+
+Pull the repo, install once, then run `wizard` inside any project you want to manage:
+
+```bash
+git clone https://github.com/mrthankyou/white-wizard.git
+cd white-wizard
+pip install -e .          # installs the `wizard` command
+
+cd ../your-project/       # go to the project you want to manage
+wizard                    # summon the wizard
+```
+
+That's it. The first run walks you through everything.
+
+> **Just exploring?** `wizard` runs on an offline **mock AI** by default, so you
+> can click through the whole experience with zero setup. Add `--claude` to use
+> the real [Claude CLI](https://github.com/anthropics/anthropic-tools) when you're
+> ready for real work.
 
 ---
 
@@ -36,26 +56,6 @@ panel for working at a higher level than individual files:
   time.
 
 No config files to hand-write. No agent framework to learn. One button.
-
----
-
-## Quick start
-
-```bash
-git clone https://github.com/mrthankyou/white-wizard.git
-cd white-wizard
-pip install -e .          # installs the `wizard` command
-
-cd ../your-project/       # go to the project you want to manage
-wizard                    # summon the wizard
-```
-
-That's it. The first run walks you through everything.
-
-> **Just exploring?** `wizard` runs on an offline **mock AI** by default, so you
-> can click through the whole experience with zero setup. Add `--claude` to use
-> the real [Claude CLI](https://github.com/anthropics/anthropic-tools) when you're
-> ready for real work.
 
 ---
 
@@ -82,15 +82,38 @@ next (and where it loops back on failure).
 
 ## Your control panel
 
-Once a team exists, running `wizard` again opens the management hub:
+Once a team exists, running `wizard` again opens the management hub — a split pane
+with the **menu** on the left and the **live task feed** on the right.
+
+**Main menu:**
 
 | Choose | What it does |
 |---|---|
-| **Give the team a task** | Describe a feature or change; the wizard plans which agents handle it and how. |
-| **Manage the system** | Ask the wizard about your current orchestration. |
+| **What do you want the team to do?** | Describe a feature or change; the wizard plans which agents handle it and how. |
+| **Manage** | Open the management submenu (below). |
 | **Something else** | Free-form question to the wizard. |
-| **Start streaming** | Kick off stream mode (see below). |
-| **Wipe the system** | Delete the generated orchestration. (Your settings are kept.) |
+| **Enable / Disable stream** | Toggle stream mode (see below). |
+| **Build a new team** | Generate another orchestration. |
+| **Quit** | Stop the background AI and exit. |
+
+**Manage submenu:**
+
+| Choose | What it does |
+|---|---|
+| **Adjust the orchestration** | Refine the team in your own words. |
+| **Clear all tasks & findings** | Empty the task queue, findings, and history (keeps the team). |
+| **View diagram** | Show the agent-flow infographic. |
+| **Enable / Disable auto-fix** | When on, the stream fixes scan findings automatically. |
+| **Enable / Disable auto-commit** | When on, completed task changes are committed to git. |
+| **Wipe the orchestration system** | Delete the generated orchestration. (Your settings are kept.) |
+
+**Task feed** — press `→` to focus it, `↑↓` to select, then `Enter`:
+
+| On a… | Enter does |
+|---|---|
+| **Suggested finding** | Dispatches the fix as real work (agentic edit + commit). |
+| **Pending task** (stream paused) | Runs that one task in the background. |
+| **Completed task** | Opens its detail view — description, commit, and the diff with line numbers (`↑↓` to scroll, `←` to go back). |
 
 ---
 
@@ -100,8 +123,11 @@ Stream mode is where White Wizard runs *itself*. It walks a prioritized checklis
 against your live codebase and decides, finding by finding, what's worth your
 attention.
 
+Toggle it from the main menu with **Enable / Disable stream** (use `--claude` so
+it does real work):
+
 ```bash
-wizard --claude --stream
+wizard --claude
 ```
 
 It runs as a tiny two-state loop:
@@ -202,8 +228,9 @@ orchestrator
 |------|-------------|
 | `--mock` | Use the offline mock AI backend (**default** — no setup needed). |
 | `--claude` | Use the real Claude CLI (`claude -p`) for AI calls. |
-| `--stream` | Run stream mode against the current codebase (requires `wizard.yaml`). |
-| `--help` | Show help and exit. |
+| `--help`, `-h` | Show help and exit. |
+
+> Stream mode is no longer a flag — toggle it from the main menu once a team exists.
 
 Run without installing:
 

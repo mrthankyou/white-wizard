@@ -118,8 +118,13 @@ def add_task(orch_folder, description, task_type, is_user_prompt=False, status="
 
 
 def get_next_suggested(orch_folder):
-    """Return the oldest 'suggested' scan finding for this orch (or None) — used
-    by autonomous auto-fix to drain the suggestion queue."""
+    """Atomically claim the oldest 'suggested' finding by flipping it to 'running'.
+
+    Returns the task dict (with status already 'running'), or None if no unclaimed
+    finding exists. The UPDATE-after-SELECT inside a single transaction means two
+    concurrent callers (stream worker + user-triggered dispatch) can't both claim
+    the same row: the second UPDATE matches 0 rows (status is already 'running')
+    and returns None, preventing double-execution."""
     try:
         init_db()
         with _session() as conn:
@@ -128,9 +133,35 @@ def get_next_suggested(orch_folder):
                 "WHERE orch_folder = ? AND status = 'suggested' ORDER BY id ASC LIMIT 1",
                 (orch_folder,),
             ).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            claimed = conn.execute(
+                "UPDATE tasks SET status = 'running', updated_at = datetime('now') "
+                "WHERE id = ? AND status = 'suggested'",
+                (row["id"],),
+            ).rowcount
+            if not claimed:
+                return None  # another caller claimed it between the SELECT and UPDATE
+            return dict(row) | {"status": "running"}
     except Exception:
         return None
+
+
+def claim_finding(task_id):
+    """Atomically flip a single 'suggested' finding to 'running' by ID.
+
+    Returns True if this caller successfully claimed it, False if it was already
+    claimed (or never existed). Used by on-demand dispatch so a user-triggered
+    fix and the stream's auto-fix can't both execute the same finding."""
+    try:
+        with _session() as conn:
+            return bool(conn.execute(
+                "UPDATE tasks SET status = 'running', updated_at = datetime('now') "
+                "WHERE id = ? AND status = 'suggested'",
+                (task_id,),
+            ).rowcount)
+    except Exception:
+        return False
 
 
 def get_next_pending_task(orch_folder):

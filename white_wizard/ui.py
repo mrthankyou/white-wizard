@@ -309,6 +309,18 @@ _STATUS_PHRASES = (
 )
 
 
+def _format_task_time(ts):
+    """Format a SQLite UTC datetime string to local 'Mon D HH:MM' ('' if bad)."""
+    import datetime
+    try:
+        dt_utc = datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc)
+        dt_local = dt_utc.astimezone()
+        return dt_local.strftime("%b %-d %H:%M")
+    except (ValueError, TypeError):
+        return ""
+
+
 def _elapsed_str(updated_at):
     """Human elapsed time since a SQLite UTC 'updated_at' timestamp ('' if bad)."""
     import datetime
@@ -564,6 +576,10 @@ def _sp_draw_right(win, state):
     win.erase()
     h, right_w = win.getmaxyx()
 
+    if state.get("task_detail"):
+        _sp_draw_task_detail(win, state)
+        return
+
     orch = state.get("current_orch")
     if not orch:
         _sp_addstr(win, h // 2, 2, "No orchestration yet.",
@@ -634,7 +650,7 @@ def _sp_draw_right(win, state):
                 desc_footer_lines[-1] = desc_footer_lines[-1][:max(0, right_w - 5)] + "…"
 
     # Task list — scrolls to keep the highlighted task in view when navigating.
-    task_area_h = h - 6 - len(desc_footer_lines)
+    task_area_h = max(0, h - 6 - len(desc_footer_lines))
     scroll_info = ""
 
     if not tasks:
@@ -708,9 +724,12 @@ def _sp_draw_right(win, state):
     y = max(y + 1, h - 5 - len(desc_footer_lines))
     _sp_addstr(win, y, 2, "─" * max(0, right_w - 4),
                curses.color_pair(_CP_DIM) | curses.A_DIM)
+    ts = _format_task_time(sel.get("updated_at") or sel.get("created_at", "")) if sel else ""
+    if ts:
+        _sp_addstr(win, y, 2, f" {ts} ", curses.color_pair(_CP_DIM) | curses.A_DIM)
     if scroll_info:
-        tag = f" {scroll_info} "
-        _sp_addstr(win, y, max(2, right_w - len(tag) - 2), tag,
+        scroll_tag = f" {scroll_info} "
+        _sp_addstr(win, y, max(2, right_w - len(scroll_tag) - 2), scroll_tag,
                    curses.color_pair(_CP_GOLD))
     y += 1
 
@@ -724,6 +743,10 @@ def _sp_draw_right(win, state):
     if focus_right:
         if sel and sel.get("status") == "suggested":
             _sp_addstr(win, y, 2, "press Enter to fix this finding (runs in background)", gold)
+            y += 1
+            _sp_addstr(win, y, 2, "↑↓ select   ← back", dim)
+        elif sel and sel.get("status") == "done":
+            _sp_addstr(win, y, 2, "press Enter to view commit & diff", gold)
             y += 1
             _sp_addstr(win, y, 2, "↑↓ select   ← back", dim)
         elif sel and sel.get("status") == "pending" and not stream_enabled:
@@ -747,6 +770,103 @@ def _sp_draw_right(win, state):
             _sp_addstr(win, y, 2, "‖ stream paused", dim)
         else:
             _sp_addstr(win, y, 2, "● streaming", curses.color_pair(_CP_GREEN))
+
+    win.noutrefresh()
+
+
+def _sp_draw_task_detail(win, state):
+    """Render the task detail view in the right pane: description, commit, diff."""
+    import curses
+    win.erase()
+    h, w = win.getmaxyx()
+    detail = state.get("task_detail", {})
+    scroll = state.get("detail_scroll", 0)
+
+    gold  = curses.color_pair(_CP_GOLD)  | curses.A_BOLD
+    dim   = curses.color_pair(_CP_DIM)   | curses.A_DIM
+    green = curses.color_pair(_CP_GREEN)
+    red   = curses.color_pair(_CP_RED)
+    cyan  = curses.color_pair(_CP_CYAN)
+
+    # Fixed header: task description (up to 2 lines)
+    y = 0
+    desc_lines = _wrap_hard((detail.get("description") or "").strip(), w - 4)[:2]
+    for ln in desc_lines:
+        _sp_addstr(win, y, 2, ln[:w - 4], gold)
+        y += 1
+    _sp_addstr(win, y, 2, "─" * max(0, w - 4), dim)
+    y += 1
+    header_h = y
+
+    # Fixed footer height (separator + hint)
+    footer_h = 2
+    body_h   = max(1, h - header_h - footer_h)
+
+    # Build body lines: commit summary first, then the diff with line numbers.
+    # Each entry is (lnum_str, content_str, lnum_attr, content_attr).
+    # lnum_str is 5 chars wide ("NNNN " or "     " for non-code lines).
+    import re as _re
+    _hunk_re = _re.compile(r'^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@')
+    NO_LNUM = "     "
+
+    body_lines = []  # (lnum, content, lnum_attr, content_attr)
+    commit  = detail.get("commit")
+    summary = detail.get("summary", "")
+    if commit:
+        body_lines.append((NO_LNUM, f"commit {commit}", dim, dim))
+    if summary:
+        body_lines.append((NO_LNUM, summary, dim, dim))
+    if body_lines:
+        body_lines.append((NO_LNUM, "", dim, dim))
+
+    old_line = new_line = 0
+    for raw in detail.get("diff_lines", []):
+        m = _hunk_re.match(raw)
+        if m:
+            old_line = int(m.group(1))
+            new_line = int(m.group(2))
+            body_lines.append((NO_LNUM, raw, cyan, cyan))
+        elif raw.startswith("+") and not raw.startswith("+++"):
+            lnum = f"{new_line:4d} "
+            new_line += 1
+            body_lines.append((lnum, raw, green, green))
+        elif raw.startswith("-") and not raw.startswith("---"):
+            lnum = f"{old_line:4d} "
+            old_line += 1
+            body_lines.append((lnum, raw, red, red))
+        elif raw.startswith(" "):  # context line
+            lnum = f"{new_line:4d} "
+            old_line += 1
+            new_line += 1
+            body_lines.append((lnum, raw, dim, dim))
+        else:
+            body_lines.append((NO_LNUM, raw, dim, dim))
+
+    # Publish the max valid scroll back to the shared task_detail dict so the
+    # key handler can clamp KEY_DOWN (this dict is the same object held in ui).
+    max_scroll = max(0, len(body_lines) - body_h)
+    detail["_max_scroll"] = max_scroll
+    scroll = min(scroll, max_scroll)
+
+    # Scroll and render body; line number and content colored independently
+    lnum_w   = len(NO_LNUM)
+    content_x = 2 + lnum_w
+    visible  = body_lines[scroll: scroll + body_h]
+    for lnum, content, lnum_attr, content_attr in visible:
+        _sp_addstr(win, y, 2, lnum, lnum_attr | curses.A_DIM)
+        _sp_addstr(win, y, content_x, content[:max(0, w - content_x - 2)], content_attr)
+        y += 1
+
+    # Fixed footer
+    y = h - footer_h
+    _sp_addstr(win, y, 2, "─" * max(0, w - 4), dim)
+    y += 1
+    has_more = (scroll + body_h) < len(body_lines)
+    hint = "↑↓ scroll" if body_lines else ""
+    if has_more:
+        hint += "  ▼ more"
+    hint += "   ← back"
+    _sp_addstr(win, y, 2, hint.strip(), dim)
 
     win.noutrefresh()
 
@@ -786,6 +906,8 @@ def run_split_pane(get_state_fn, get_options_fn, handle_choice_fn,
             "task_id":      None,     # ...anchored to the task's id, so the live
                                       # list churning (new tasks prepended) doesn't
                                       # drag the selection onto a different task
+            "task_detail":  None,     # dict from _build_task_detail when viewing a done task
+            "detail_scroll": 0,       # scroll offset within the detail diff view
         }
         data = {}
         left_win = right_win = None
@@ -873,13 +995,27 @@ def run_split_pane(get_state_fn, get_options_fn, handle_choice_fn,
             on_text = bool(cur_opt and cur_opt.text_input)
             field_w = max(1, left_w - 4)
 
-            # --- focus-right (task pane) navigation ---
+            # --- focus-right (task pane / detail view) navigation ---
             if ui["focus"] == "right" and key in (curses.KEY_LEFT, 27):  # ← / Esc
-                ui["focus"] = "left"
+                if ui["task_detail"] is not None:
+                    ui["task_detail"]  = None
+                    ui["detail_scroll"] = 0
+                else:
+                    ui["focus"] = "left"
                 ui["last_refresh"] = 0
                 continue
             if ui["focus"] == "right":
-                if not tasks:
+                if ui["task_detail"] is not None:
+                    # Detail view: ↑↓ scroll the diff (clamped to the rendered
+                    # range the draw published in _max_scroll for this frame).
+                    if key == curses.KEY_UP:
+                        ui["detail_scroll"] = max(0, ui["detail_scroll"] - 1)
+                    elif key == curses.KEY_DOWN:
+                        max_scroll = ui["task_detail"].get("_max_scroll", 0)
+                        ui["detail_scroll"] = min(ui["detail_scroll"] + 1, max_scroll)
+                    elif key in (ord("q"), ord("Q")):
+                        return None
+                elif not tasks:
                     ui["focus"] = "left"
                 elif key == curses.KEY_UP:
                     ui["task_i"] = (ui["task_i"] - 1) % len(tasks)
@@ -889,12 +1025,15 @@ def run_split_pane(get_state_fn, get_options_fn, handle_choice_fn,
                     ui["task_i"] = (ui["task_i"] + 1) % len(tasks)
                     ui["task_id"] = tasks[ui["task_i"]].get("id")
                     ui["last_refresh"] = 0
-                elif key in (10, 13):  # Enter — run the highlighted task
+                elif key in (10, 13):  # Enter — act on the highlighted task
                     if handle_task_fn and 0 <= ui["task_i"] < len(tasks):
                         result = handle_task_fn(tasks[ui["task_i"]], merged)
-                        if result == "__quit__":
+                        if isinstance(result, dict) and "task_detail" in result:
+                            ui["task_detail"]  = result["task_detail"]
+                            ui["detail_scroll"] = 0
+                        elif result == "__quit__":
                             return None
-                        if result == "__refresh__":
+                        elif result == "__refresh__":
                             return "__refresh__"
                         ui["last_refresh"] = 0
                 elif key in (ord("q"), ord("Q")):

@@ -81,11 +81,14 @@ class OrchestrationLifecycleTest(unittest.TestCase):
 
         # The main menu is now a curses split pane. Stand in for it: quit
         # immediately unless a wipe was requested, in which case drive the
-        # "wipe" choice (which itself falls back to the patched menu to confirm).
+        # "wipe" choice. Wipe now lives under the "Manage" submenu, so enter
+        # manage mode first (the wipe handler falls back to the patched menu to
+        # confirm).
         def fake_pane(get_state_fn, get_options_fn, handle_choice_fn,
                       handle_task_fn=None, _m=self.menu):
             if not _m.wipe:
                 return None
+            handle_choice_fn("manage", "", get_state_fn(0))
             return handle_choice_fn("wipe", "", get_state_fn(0))
 
         self._patches = [
