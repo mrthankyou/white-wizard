@@ -29,15 +29,15 @@ cd white-wizard
 pip install -e .          # installs the `wizard` command
 
 cd ../your-project/       # go to the project you want to manage
-wizard                    # summon the wizard
+wizard --claude           # summon the wizard (real Claude CLI)
 ```
 
 That's it. The first run walks you through everything.
 
-> **Just exploring?** `wizard` runs on an offline **mock AI** by default, so you
-> can click through the whole experience with zero setup. Add `--claude` to use
-> the real [Claude CLI](https://github.com/anthropics/anthropic-tools) when you're
-> ready for real work.
+> **Just exploring?** Drop `--claude` and run plain `wizard` to use the offline
+> **mock AI** — you can click through the whole experience with zero setup. The
+> `--claude` flag uses the real [Claude CLI](https://github.com/anthropics/anthropic-tools)
+> for real work (it must be installed and on your PATH).
 
 ---
 
