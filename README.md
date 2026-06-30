@@ -1,4 +1,4 @@
-# White Wizard
+# The White Wizard
 
 ```
                 /\
