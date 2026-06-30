@@ -1977,6 +1977,11 @@ def main():
         {o.get("team_folder") for o in list_orchestrations() if o.get("team_folder")})
     if pruned:
         _stream_log(f"pruned {pruned} orphaned task(s) from removed orchestration(s)")
+    # Reset tasks left 'running' by a crashed/killed prior session before workers
+    # start, so they don't show a perpetual flame or strand a claimed finding.
+    interrupted = wizard_db.reset_running_tasks()
+    if interrupted:
+        _stream_log(f"reset {interrupted} interrupted task(s) from a previous session")
     _start_stream_workers()
     while True:
         if load_orchestration():

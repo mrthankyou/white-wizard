@@ -238,6 +238,24 @@ def delete_stream_config(orch_folder):
         pass
 
 
+def reset_running_tasks():
+    """Reset tasks stuck in 'running' from a previous session (the app crashed or
+    was killed mid-task) so the UI doesn't show a perpetual in-progress task and a
+    claimed-but-unfinished finding isn't lost. Marks them 'failed' with an
+    'interrupted' note. Returns how many were reset. Best-effort; call at startup
+    before workers start."""
+    try:
+        init_db()
+        with _session() as conn:
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'failed', "
+                "summary = 'Interrupted — the session ended before it finished', "
+                "updated_at = datetime('now') WHERE status = 'running'")
+            return cur.rowcount or 0
+    except Exception:
+        return 0
+
+
 def prune_orphaned_state(known_folders):
     """Delete tasks and stream_config for orchestrations not in ``known_folders``
     (e.g. wiped in an earlier session, before wipe cleaned the DB). Returns the

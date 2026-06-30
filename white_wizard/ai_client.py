@@ -29,6 +29,7 @@ _procs_lock = threading.Lock()
 _logger = None        # AI request/response logger, set by enable_debug_logging
 _log_path = None      # path to the active debug log
 _seq = 0              # request counter, to pair prompts with responses
+_seq_lock = threading.Lock()  # guards _seq — concurrent workers log in parallel
 
 
 def enable_debug_logging():
@@ -129,8 +130,9 @@ def _log_request(backend, model, messages):
     global _seq
     if _logger is None:
         return None
-    _seq += 1
-    req_id = _seq
+    with _seq_lock:
+        _seq += 1
+        req_id = _seq
     _logger.info("--- REQUEST #%d (backend=%s, model=%s) ---", req_id, backend, model or "default")
     for m in messages:
         _logger.info("[%s]\n%s", m.get("role", "?"), m.get("content", ""))
