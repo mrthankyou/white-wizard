@@ -51,9 +51,9 @@ panel for working at a higher level than individual files:
 - 🧙 **Manage the team** — spin up, inspect, or tear down your agent orchestration.
 - 🛠️ **Ship features** — tell the team *what* you want; it figures out *which*
   agents do *what*, and in what order.
-- 🔄 **Let it think on its own** — stream mode loops over your live codebase,
-  surfaces bugs and drift, and even rewrites its own checklist to get smarter over
-  time.
+- 🔄 **Let it run on its own** — stream mode works in the background, scanning
+  your live codebase for bugs, missing tests, and cleanup, and can fix what it
+  finds (with changes committed for you).
 
 No config files to hand-write. No agent framework to learn. One button.
 
@@ -117,45 +117,40 @@ with the **menu** on the left and the **live task feed** on the right.
 
 ---
 
-## Stream mode — the self-looping mind 🔄
+## Stream mode — the background worker 🔄
 
-Stream mode is where White Wizard runs *itself*. It walks a prioritized checklist
-against your live codebase and decides, finding by finding, what's worth your
-attention.
-
-Toggle it from the main menu with **Enable / Disable stream** (use `--claude` so
-it does real work):
+Stream mode is where White Wizard works on its own. Toggle it from the main menu
+with **Enable / Disable stream** (use `--claude` so it does real work):
 
 ```bash
 wizard --claude
 ```
 
-It runs as a tiny two-state loop:
+When enabled, a background worker loops over your project and fills the **task
+feed** in the right pane. Each pass it does one thing, in priority order:
 
-1. **Answer** — an agent answers the current review thought about your code.
-2. **Route** — the White Wizard judges that answer: is it a real, actionable
-   finding, or a no-op? Then it picks the next question to ask.
+1. **Your tasks first** — anything you queued via *"What do you want the team to
+   do?"* runs ahead of everything else.
+2. **Auto-fix a finding** — if **auto-fix** is on, it takes the oldest open
+   finding and fixes it (agentic edit + commit).
+3. **Scan** — otherwise it runs the next check in its rotation and records what it
+   finds. For a dev team the rotation is: bugs → missing tests → refactors → docs.
 
-No-ops are auto-dismissed so you only see what matters. For each real finding you
-**Approve**, **Skip**, or **Quit**.
+Each scan produces **findings**, saved as `Suggested fix` items in the feed. A
+finding is a suggestion, not an automatic change: highlight it and press `Enter`
+to fix it on demand, or turn on **auto-fix** to let the worker drain them itself.
+Only one task edits your working tree at a time (serialized behind a lock), so
+concurrent runs never corrupt each other's changes or commits.
 
-Stream mode maintains; it does not build. Its **thoughts** serve two axes —
-*primary:* keep the AI orchestration system healthy; *secondary:* maintain the
-codebase via refactors and bug fixes (never new features). Out of the box:
+Two settings (in the **Manage** submenu, persisted to `wizard.yaml`) shape this:
 
-- **Orchestration drift** *(primary)* — did the code change in a way that means
-  the agent team should change too?
-- **Reusable tools** *(primary)* — do several agents repeat the same command? If
-  so, it can build a shared MCP tool and rewire the agents to use it.
-- **Bugs** *(secondary)* — anything that should be surfaced as a fix?
-- **Code health** *(secondary)* — old, duplicated, or overly complex code worth
-  refactoring for maintainability?
-- **Self-improvement** *(meta)* — should the stream thoughts *themselves* be
-  rewritten? When it proposes a better set, it writes them back to `wizard.yaml`
-  — so the wizard literally gets smarter the more you run it.
+- **Auto-commit** *(on by default)* — commit each completed task's changes to git
+  with a generated message. Turn it off to review changes yourself.
+- **Auto-fix** *(off by default)* — let the worker act on findings without you.
 
-Every finding (the reviewed orchestration/code text) is saved to
-`.wizard/state.db` so you have a history of what stream mode has surfaced.
+Every task and finding is saved to `.wizard/state.db`, so the feed survives across
+runs and you keep a history of what the wizard has done. A task interrupted by a
+crash or quit is marked failed on the next start, so nothing shows a stuck spinner.
 
 ---
 
@@ -174,8 +169,11 @@ When you approve a plan, Wizard writes into your project:
       state_machine.py       # FastMCP state-machine tool (drives delegation order)
       ...
 .mcp.json                   # registers the state-machine tool for Claude
-wizard.yaml                 # the wizard's own config (settings + stream thoughts)
+wizard.yaml                 # the wizard's own config (model, auto-commit, auto-fix)
 ```
+
+> With **auto-commit** on (the default), the wizard also commits the generated
+> orchestration to git for you once its smoke test passes.
 
 The orchestration lives in the AI's **own** store — `.claude/` for Claude — which
 the wizard treats as the source of truth. `wizard.yaml` holds only the wizard's
@@ -193,8 +191,9 @@ paths to remediate.
 | Location | Contents |
 |---|---|
 | `.claude/` | The orchestration itself (manifest + Claude-native subagents). Source of truth. |
-| `wizard.yaml` | The wizard's own config: stream questions, settings. Commit it. |
-| `.wizard/state.db` | Runtime: stream run history, findings, scan stats. Gitignored. |
+| `wizard.yaml` | The wizard's own config: model, auto-commit, auto-fix. Commit it. |
+| `.wizard/state.db` | Runtime: the task queue, findings, and stream state. Gitignored. |
+| `.wizard/stream.log`, `.wizard/debug.log` | Background-worker activity and AI prompt/response traces. Gitignored. |
 
 ---
 
