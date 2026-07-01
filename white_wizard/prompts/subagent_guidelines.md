@@ -32,7 +32,7 @@ prompt. Only `name` and `description` are required.
 name: code-reviewer            # lowercase letters and hyphens, unique
 description: Reviews code changes for correctness and security. Use proactively after code is written.
 tools: Read, Grep, Glob, Bash  # optional — omit to inherit all; grant least privilege
-model: claude-sonnet-4-6       # optional
+model: claude-sonnet-5         # optional
 ---
 
 You are a senior code reviewer for this project.

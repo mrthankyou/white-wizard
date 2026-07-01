@@ -26,7 +26,7 @@ from white_wizard.ui import (
 # Constants (terminal primitives + the menu engine live in white_wizard.ui)
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "claude-sonnet-5"
 
 # Keep the build/infographic view up at least this long so it can be read.
 MIN_BUILD_DISPLAY_SECONDS = 15
